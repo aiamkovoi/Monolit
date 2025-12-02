@@ -1,0 +1,961 @@
+# -*- coding: utf-8 -*-
+__title__ = "Проверка ТОЛЬКО отверстий"
+__doc__ = u"""Version = 1.3
+Упрощённая проверка отверстий (все внутренние лупы)
+между КР-стороной и АР-связями + точки в центрах несоответствий.
+
+Логика отверстий взята из скрипта 'Проверка на монолит' v7.3,
+но дополнена более «мягким» сравнением отверстий:
+
+• Host-модель считается КР.
+• В связях по имени определяется роль: КР или АР.
+• Элементы берутся из несущих категорий (STRUCT_CAT_IDS) и только
+  с материалом, в названии которого есть 'бетон' или 'монолит'.
+• Отверстия = ВСЕ внутренние лупы граней элементов (closed loops).
+• Пользователь задает минимальный размер отверстий (две большие стороны).
+  0 — без фильтра по минимуму размера (учитываем все отверстия).
+• Для плит (OST_Floors) внутри отверстия строится несколько sample-точек
+  вдоль длинной стороны (отступ 50 мм от краёв, шаг ~200 мм).
+• Два отверстия считаются совпадающими, если:
+    - размеры похожи (по двум большим сторонам в допуске),
+    - и хотя бы одна пара sample-точек попала в радиус 50 мм.
+• В центрах всех НЕСОВПАВШИХ отверстий (КР и АР) создаются семейства 'Точка'.
+  Если точка уже есть в радиусе 20 мм, новая не создаётся.
+
+Дополнительно:
+• Игнорируются термовкладыши заданных размеров:
+    - ПЛИТЫ: 200x600 и 200x500 мм
+    - СТЕНЫ: 180x300, 170x300, 230x300, 200x250 мм
+  (с допуском ±20 мм по каждой из двух больших сторон).
+"""
+
+import clr
+
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    FamilySymbol,
+    FamilyInstance,
+    GeometryInstance,
+    Options,
+    XYZ,
+    BuiltInParameter,
+    RevitLinkInstance,
+    BoundingBoxXYZ,
+    BuiltInCategory,
+    ViewDetailLevel,
+    LocationPoint,
+    Solid,
+    Transaction,
+    Element,
+)
+from Autodesk.Revit.DB.Structure import StructuralType
+from Autodesk.Revit.UI.Selection import ObjectType
+from Autodesk.Revit.UI import TaskDialog
+
+from pyrevit import forms
+
+doc   = __revit__.ActiveUIDocument.Document
+uidoc = __revit__.ActiveUIDocument
+app   = __revit__.Application
+
+# ---------- МАТЕРИАЛЫ (бетон / монолит) ----------
+
+TARGET_MAT_KEYWORDS = [u"бетон", u"монолит"]
+
+
+def safe_name(el):
+    if el is None:
+        return None
+    try:
+        return Element.Name.__get__(el)
+    except:
+        try:
+            return el.Name
+        except:
+            try:
+                p = el.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+                if p:
+                    return p.AsString()
+            except:
+                pass
+    return None
+
+
+def element_has_target_material(elem, revit_doc):
+    if elem is None:
+        return False
+
+    try:
+        mat_ids = elem.GetMaterialIds(False)
+    except:
+        try:
+            mat_ids = elem.GetMaterialIds(True)
+        except:
+            mat_ids = set()
+
+    if not mat_ids:
+        return False
+
+    for mid in mat_ids:
+        mat = revit_doc.GetElement(mid)
+        if mat is None:
+            continue
+        name = safe_name(mat)
+        if not name:
+            continue
+        n = name.lower()
+        for kw in TARGET_MAT_KEYWORDS:
+            if kw in n:
+                return True
+
+    return False
+
+
+# ---------- КАТЕГОРИИ: НЕСУЩИЕ ----------
+
+STRUCT_CAT_IDS = set([
+    int(BuiltInCategory.OST_Walls),
+    int(BuiltInCategory.OST_StructuralFraming),
+    int(BuiltInCategory.OST_StructuralColumns),
+    int(BuiltInCategory.OST_StructuralFoundation),
+    int(BuiltInCategory.OST_Floors),
+    int(BuiltInCategory.OST_Stairs),
+])
+
+
+def get_cat_id(elem):
+    try:
+        cat = elem.Category
+        if cat:
+            return cat.Id.IntegerValue
+    except:
+        pass
+    return None
+
+
+def is_structural_element(elem):
+    cid = get_cat_id(elem)
+    return cid in STRUCT_CAT_IDS
+
+
+# ---------- ЕДИНИЦЫ / ДОПУСКИ ----------
+
+def mm_to_ft(v_mm):
+    return v_mm / 304.8
+
+
+POS_TOL_MM = 20.0
+POS_TOL_FT = mm_to_ft(POS_TOL_MM)
+
+SIZE_TOL_MM = 20.0
+SIZE_TOL_FT = mm_to_ft(SIZE_TOL_MM)
+
+BBOX_FACE_TOL_MM = 5.0
+BBOX_FACE_TOL_FT = mm_to_ft(BBOX_FACE_TOL_MM)
+
+# радиус совпадения новой точки c существующей (для семейств 'Точка')
+POINT_MATCH_RADIUS_MM = 20.0
+POINT_MATCH_RADIUS_FT = mm_to_ft(POINT_MATCH_RADIUS_MM)
+POINT_MATCH_RADIUS2_FT = POINT_MATCH_RADIUS_FT * POINT_MATCH_RADIUS_FT
+
+# шаг по длинной стороне отверстия и отступ от краёв (для sample-точек)
+OPENING_EDGE_OFFSET_MM = 50.0      # отступ от коротких сторон
+OPENING_SAMPLE_STEP_MM = 200.0     # целевой шаг между точками вдоль отверстия
+
+OPENING_EDGE_OFFSET_FT = mm_to_ft(OPENING_EDGE_OFFSET_MM)
+OPENING_SAMPLE_STEP_FT = mm_to_ft(OPENING_SAMPLE_STEP_MM)
+
+# радиус совпадения sample-точек между двумя отверстиями
+OPENING_SAMPLE_MATCH_RADIUS_MM = 50.0
+OPENING_SAMPLE_MATCH_RADIUS_FT = mm_to_ft(OPENING_SAMPLE_MATCH_RADIUS_MM)
+OPENING_SAMPLE_MATCH_RADIUS2_FT = OPENING_SAMPLE_MATCH_RADIUS_FT * OPENING_SAMPLE_MATCH_RADIUS_FT
+
+# ---------- ТЕРМОВКЛАДЫШИ (ЖЁСТКО ЗАДАННЫЕ РАЗМЕРЫ) ----------
+
+# Допуск по двум большим сторонам (мм и футы)
+THERMO_TOL_MM = 20.0
+THERMO_TOL_FT = mm_to_ft(THERMO_TOL_MM)
+
+# ПЛИТЫ: 200x600 и 200x500
+THERMO_FLOOR_SIZES_MM = [
+    (200.0, 600.0),
+    (200.0, 500.0),
+]
+
+# СТЕНЫ: 180x300, 170x300, 230x300, 200x250
+THERMO_WALL_SIZES_MM = [
+    (180.0, 300.0),
+    (170.0, 300.0),
+    (230.0, 300.0),
+    (200.0, 250.0),
+]
+
+THERMO_FLOOR_SIZES_FT = [(mm_to_ft(a), mm_to_ft(b)) for a, b in THERMO_FLOOR_SIZES_MM]
+THERMO_WALL_SIZES_FT  = [(mm_to_ft(a), mm_to_ft(b)) for a, b in THERMO_WALL_SIZES_MM]
+
+
+def dims_match_pair(side_big_ft, side_mid_ft, pair_big_ft, pair_mid_ft, tol_ft):
+    """
+    Сравнение двух размеров (две большие стороны) с допуском, с учётом перестановки.
+    side_big_ft / side_mid_ft - уже отсортированные стороны отверстия (max, средняя).
+    pair_big_ft / pair_mid_ft - стороны шаблона (термовкладыш).
+    """
+    # прямое совпадение
+    if abs(side_big_ft - pair_big_ft) <= tol_ft and abs(side_mid_ft - pair_mid_ft) <= tol_ft:
+        return True
+    # на случай, если где-то перепутали местами
+    if abs(side_big_ft - pair_mid_ft) <= tol_ft and abs(side_mid_ft - pair_big_ft) <= tol_ft:
+        return True
+    return False
+
+
+# ---------- ВВОД МИНИМАЛЬНОГО РАЗМЕРА ОТВЕРСТИЙ ----------
+
+def parse_min_opening_size_mm(default_mm=200.0):
+    try:
+        s = forms.ask_for_string(
+            prompt=u"Минимальный размер отверстий, которые учитываем (мм).\n"
+                   u"Отверстия меньше этого размера будут игнорироваться.\n"
+                   u"Примеры: '200', '300x200', '300 x 200'.\n"
+                   u"По умолчанию: {0} x {0} мм.\n"
+                   u"Для отключения фильтра (учитывать все отверстия) введи 0.".format(int(default_mm)),
+            title=__title__,
+            default=str(int(default_mm))
+        )
+    except:
+        s = None
+
+    if s is None:
+        return default_mm, default_mm
+
+    s = s.strip()
+    if not s:
+        return default_mm, default_mm
+
+    s = s.lower().replace(u'×', 'x')
+    s = s.replace('*', 'x')
+    s = s.replace(' ', '')
+    parts = s.split('x')
+
+    nums = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            v = float(p.replace(',', '.'))
+            if v < 0:
+                v = 0.0
+            nums.append(v)
+        except:
+            pass
+
+    if not nums:
+        return default_mm, default_mm
+
+    if len(nums) == 1:
+        return nums[0], nums[0]
+    else:
+        return nums[0], nums[1]
+
+
+# ---------- SOLID EXTRACTION + КЭШ ----------
+
+def get_all_solids(elem):
+    solids = []
+    if elem is None:
+        return solids
+
+    opt = Options()
+    opt.DetailLevel = ViewDetailLevel.Fine
+    opt.IncludeNonVisibleObjects = True
+
+    try:
+        geom = elem.get_Geometry(opt)
+    except:
+        geom = None
+
+    if not geom:
+        return solids
+
+    for g in geom:
+        if isinstance(g, Solid):
+            if g is not None and g.Volume > 1e-9:
+                try:
+                    faces = g.Faces
+                    edges = g.Edges
+                except:
+                    faces = None
+                    edges = None
+                if faces and (not faces.IsEmpty) and edges and (not edges.IsEmpty):
+                    solids.append(g)
+
+        if isinstance(g, GeometryInstance):
+            try:
+                inst_geom = g.GetInstanceGeometry()
+            except:
+                inst_geom = None
+
+            if not inst_geom:
+                continue
+            for gg in inst_geom:
+                if isinstance(gg, Solid):
+                    if gg is not None and gg.Volume > 1e-9:
+                        try:
+                            faces = gg.Faces
+                            edges = gg.Edges
+                        except:
+                            faces = None
+                            edges = None
+                        if faces and (not faces.IsEmpty) and edges and (not edges.IsEmpty):
+                            solids.append(gg)
+
+    return solids
+
+
+def get_cached_solids(elem, cache_dict):
+    if elem is None:
+        return []
+    key = elem.Id.IntegerValue
+    if key in cache_dict:
+        return cache_dict[key]
+    solids = get_all_solids(elem)
+    cache_dict[key] = solids
+    return solids
+
+
+# ---------- LINK ROLE: KR / AR ----------
+
+def classify_link_role(link_inst):
+    name = safe_name(link_inst) or u""
+    title = u""
+    try:
+        ldoc = link_inst.GetLinkDocument()
+        if ldoc and ldoc.Title:
+            title = ldoc.Title
+    except:
+        pass
+
+    s = (name + u" " + title).lower()
+
+    if u"кр" in s or "_kr" in s or " kr" in s:
+        return "KR"
+    if u"ар" in s or "_ar" in s or " ar" in s:
+        return "AR"
+
+    # по умолчанию считаем АР
+    return "AR"
+
+
+class LinkContext(object):
+    def __init__(self, inst):
+        self.Inst = inst
+        self.Tr = inst.GetTotalTransform()
+        self.Doc = inst.GetLinkDocument()
+        self.Role = None
+        self.RawElems = []
+        self.StructElems = []
+
+
+# ---------- BBOX УТИЛИТЫ ----------
+
+def make_bbox_from_points(points):
+    if not points:
+        return None
+    xs = [p.X for p in points]
+    ys = [p.Y for p in points]
+    zs = [p.Z for p in points]
+
+    bb = BoundingBoxXYZ()
+    bb.Min = XYZ(min(xs), min(ys), min(zs))
+    bb.Max = XYZ(max(xs), max(ys), max(zs))
+    return bb
+
+
+def grow_bbox(bb, tol_ft):
+    if bb is None:
+        return None
+    bb2 = BoundingBoxXYZ()
+    bb2.Min = XYZ(bb.Min.X - tol_ft,
+                  bb.Min.Y - tol_ft,
+                  bb.Min.Z - tol_ft)
+    bb2.Max = XYZ(bb.Max.X + tol_ft,
+                  bb.Max.Y + tol_ft,
+                  bb.Max.Z + tol_ft)
+    return bb2
+
+
+def point_in_bbox(p, bb):
+    if bb is None:
+        return True
+    if p.X < bb.Min.X or p.X > bb.Max.X:
+        return False
+    if p.Y < bb.Min.Y or p.Y > bb.Max.Y:
+        return False
+    if p.Z < bb.Min.Z or p.Z > bb.Max.Z:
+        return False
+    return True
+
+
+# ---------- ОТВЕРСТИЯ ПО ЛУПАМ + SAMPLE-ТОЧКИ ----------
+
+class Opening(object):
+    def __init__(self, center, dims_sorted, element, face_id, is_floor=False, samples=None):
+        self.Center     = center
+        self.DimsSorted = dims_sorted
+        self.ElementId  = element.Id
+        self.FaceId     = face_id
+        self.IsFloor    = is_floor
+        self.Samples    = samples if samples is not None else [center]
+
+
+def build_opening_sample_points(center, dx, dy, dz, is_floor):
+    """
+    Строим точки сравнения внутри отверстия.
+
+    Для плит:
+      - выбираем ось с максимальной протяженностью (dx или dy),
+      - отступаем от краёв 50 мм,
+      - между точками шаг ~200 мм,
+      - если отверстие маленькое - только центр.
+
+    Для остальных элементов пока возвращаем только центр.
+    """
+    if not is_floor:
+        return [center]
+
+    length = dx
+    axis = 'X'
+    if dy > length:
+        length = dy
+        axis = 'Y'
+
+    if length <= 1e-6:
+        return [center]
+
+    eff_len = length - 2.0 * OPENING_EDGE_OFFSET_FT
+    if eff_len <= 0.0:
+        return [center]
+
+    step = OPENING_SAMPLE_STEP_FT
+    n_intervals = int(eff_len / step)
+    if n_intervals < 1:
+        n_intervals = 1
+
+    n_points = n_intervals + 1
+    real_step = eff_len / float(n_intervals)
+
+    pts = []
+    start_offset = -0.5 * eff_len
+
+    for i in range(n_points):
+        offset = start_offset + i * real_step
+        if axis == 'X':
+            p = XYZ(center.X + offset, center.Y, center.Z)
+        else:
+            p = XYZ(center.X, center.Y + offset, center.Z)
+        pts.append(p)
+
+    add_center = True
+    for p in pts:
+        dx0 = p.X - center.X
+        dy0 = p.Y - center.Y
+        dz0 = p.Z - center.Z
+        if dx0*dx0 + dy0*dy0 + dz0*dz0 <= 1e-8:
+            add_center = False
+            break
+    if add_center:
+        pts.append(center)
+
+    return pts
+
+
+def collect_openings_from_elements(elems, tr_to_host=None, cache_dict=None,
+                                   min_side_big_ft=0.0, min_side_mid_ft=0.0):
+    openings = []
+    face_counter = 0
+
+    for el in elems:
+        try:
+            if cache_dict is not None:
+                solids = get_cached_solids(el, cache_dict)
+            else:
+                solids = get_all_solids(el)
+        except:
+            solids = []
+
+        if not solids:
+            continue
+
+        cat_id_val = None
+        try:
+            if el.Category:
+                cat_id_val = el.Category.Id.IntegerValue
+        except:
+            cat_id_val = None
+
+        is_wall  = (cat_id_val == int(BuiltInCategory.OST_Walls))
+        is_floor = (cat_id_val == int(BuiltInCategory.OST_Floors))
+
+        try:
+            bb_elem = el.get_BoundingBox(None)
+        except:
+            bb_elem = None
+
+        z_min = z_max = None
+        if bb_elem is not None:
+            z_min = bb_elem.Min.Z
+            z_max = bb_elem.Max.Z
+
+        for solid in solids:
+            faces = solid.Faces
+            if faces is None or faces.IsEmpty:
+                continue
+
+            for face in faces:
+                loops = face.EdgeLoops
+                if loops is None:
+                    continue
+                if loops.Size < 2:
+                    continue
+
+                for li in range(1, loops.Size):
+                    loop = loops[li]
+                    verts_dict = {}
+
+                    for edge in loop:
+                        try:
+                            crv = edge.AsCurve()
+                        except:
+                            crv = None
+                        if crv is None:
+                            continue
+                        try:
+                            p0 = crv.GetEndPoint(0)
+                            p1 = crv.GetEndPoint(1)
+                        except:
+                            continue
+
+                        for p in (p0, p1):
+                            if tr_to_host is not None:
+                                p = tr_to_host.OfPoint(p)
+                            key = (
+                                round(p.X / 1e-6) * 1e-6,
+                                round(p.Y / 1e-6) * 1e-6,
+                                round(p.Z / 1e-6) * 1e-6
+                            )
+                            verts_dict[key] = p
+
+                    verts = list(verts_dict.values())
+                    if len(verts) < 3:
+                        continue
+
+                    sx = sy = sz = 0.0
+                    xs = []
+                    ys = []
+                    zs = []
+                    for p in verts:
+                        sx += p.X
+                        sy += p.Y
+                        sz += p.Z
+                        xs.append(p.X)
+                        ys.append(p.Y)
+                        zs.append(p.Z)
+
+                    count = float(len(verts))
+                    cx = sx / count
+                    cy = sy / count
+                    cz = sz / count
+                    center = XYZ(cx, cy, cz)
+
+                    # для стен - отбрасываем лупы, совпадающие с нижней/верхней гранью BBox
+                    if is_wall and z_min is not None and z_max is not None:
+                        if abs(cz - z_min) <= BBOX_FACE_TOL_FT or abs(cz - z_max) <= BBOX_FACE_TOL_FT:
+                            continue
+
+                    dx = max(xs) - min(xs)
+                    dy = max(ys) - min(ys)
+                    dz = max(zs) - min(zs)
+
+                    dims_sorted = sorted([dx, dy, dz])
+
+                    side_mid_ft = dims_sorted[1]
+                    side_big_ft = dims_sorted[2]
+
+                    # --- ТЕРМОВКЛАДЫШИ: игнорируем заданные размеры для плит и стен ---
+                    if THERMO_TOL_FT > 0.0:
+                        if is_floor:
+                            skip = False
+                            for a_ft, b_ft in THERMO_FLOOR_SIZES_FT:
+                                pb = max(a_ft, b_ft)
+                                pm = min(a_ft, b_ft)
+                                if dims_match_pair(side_big_ft, side_mid_ft, pb, pm, THERMO_TOL_FT):
+                                    skip = True
+                                    break
+                            if skip:
+                                continue
+
+                        if is_wall:
+                            skip = False
+                            for a_ft, b_ft in THERMO_WALL_SIZES_FT:
+                                pb = max(a_ft, b_ft)
+                                pm = min(a_ft, b_ft)
+                                if dims_match_pair(side_big_ft, side_mid_ft, pb, pm, THERMO_TOL_FT):
+                                    skip = True
+                                    break
+                            if skip:
+                                continue
+                    # ---------------------------------------------------------------
+
+                    # фильтр «отверстий» по введённому минимуму
+                    if min_side_big_ft > 0.0 or min_side_mid_ft > 0.0:
+                        if side_big_ft < min_side_big_ft or side_mid_ft < min_side_mid_ft:
+                            continue
+
+                    face_counter += 1
+
+                    samples = build_opening_sample_points(center, dx, dy, dz, is_floor)
+
+                    openings.append(
+                        Opening(center, dims_sorted, el, face_counter, is_floor=is_floor, samples=samples)
+                    )
+
+    return openings
+
+
+def openings_are_similar(o1, o2, pos_tol_ft, size_tol_ft):
+    d1 = o1.DimsSorted
+    d2 = o2.DimsSorted
+    if len(d1) != 3 or len(d2) != 3:
+        return False
+
+    for i in (1, 2):
+        if abs(d1[i] - d2[i]) > size_tol_ft:
+            return False
+
+    v = o1.Center - o2.Center
+    if v.GetLength() > pos_tol_ft * 3.0:
+        return False
+
+    pts1 = getattr(o1, "Samples", [o1.Center])
+    pts2 = getattr(o2, "Samples", [o2.Center])
+
+    for p in pts1:
+        for q in pts2:
+            dx = p.X - q.X
+            dy = p.Y - q.Y
+            dz = p.Z - q.Z
+            d2_val = dx*dx + dy*dy + dz*dz
+            if d2_val <= OPENING_SAMPLE_MATCH_RADIUS2_FT:
+                return True
+
+    return False
+
+
+def match_openings(host_openings, link_openings, pos_tol_ft, size_tol_ft):
+    unmatched_host = []
+    used_link_idx = set()
+
+    for h in host_openings:
+        match_idx = None
+        for idx, l in enumerate(link_openings):
+            if idx in used_link_idx:
+                continue
+            if openings_are_similar(h, l, pos_tol_ft, size_tol_ft):
+                match_idx = idx
+                break
+        if match_idx is None:
+            unmatched_host.append(h)
+        else:
+            used_link_idx.add(match_idx)
+
+    unmatched_link = []
+    for idx, l in enumerate(link_openings):
+        if idx not in used_link_idx:
+            unmatched_link.append(l)
+
+    return unmatched_host, unmatched_link
+
+
+# ---------- FAMILY SYMBOL 'ТОЧКА' ----------
+
+def get_point_symbol():
+    collector = FilteredElementCollector(doc).OfClass(FamilySymbol)
+    for sym in collector:
+        sym_name = safe_name(sym)
+        fam_name = safe_name(sym.Family)
+        if sym_name == u"Точка" or fam_name == u"Точка":
+            return sym
+    return None
+
+
+# ---------- MAIN ----------
+
+def main():
+    # 5. Family 'Точка'
+    sym = get_point_symbol()
+    if not sym:
+        TaskDialog.Show(
+            __title__,
+            u"Не найден тип семейства или семейство с именем 'Точка'.\n"
+            u"Загрузи 'Точка.rfa' в проект или переименуй тип."
+        )
+        return
+    # 1. Host-элементы (КР-сторона)
+    try:
+        refs_host = uidoc.Selection.PickObjects(
+            ObjectType.Element,
+            "Выбери ЭЛЕМЕНТЫ в ТЕКУЩЕЙ модели (host, считается КР), можно рамкой"
+        )
+    except:
+        return
+
+    host_elems_raw = [doc.GetElement(r.ElementId) for r in refs_host if r is not None]
+    host_elems_raw = [e for e in host_elems_raw if e is not None]
+    host_elems_raw = [e for e in host_elems_raw if is_structural_element(e)]
+    host_struct_elems = [e for e in host_elems_raw if element_has_target_material(e, doc)]
+
+    # 2. Link-элементы (КР и АР)
+    try:
+        refs_link = uidoc.Selection.PickObjects(
+            ObjectType.LinkedElement,
+            "Выбери ЭЛЕМЕНТЫ в СВЯЗАННЫХ моделях (КР и АР), можно рамкой и несколько связей"
+        )
+    except:
+        return
+
+    if not refs_link:
+        TaskDialog.Show(__title__, u"Не выбрано ни одного элемента во связанной модели.")
+        return
+
+    link_contexts_dict = {}
+    link_elems_raw = []
+
+    for r in refs_link:
+        link_inst = doc.GetElement(r.ElementId)
+        if not isinstance(link_inst, RevitLinkInstance):
+            continue
+
+        inst_key = link_inst.Id.IntegerValue
+        ctx = link_contexts_dict.get(inst_key)
+        if ctx is None:
+            ctx = LinkContext(link_inst)
+            if ctx.Doc is None:
+                continue
+            link_contexts_dict[inst_key] = ctx
+
+        link_doc = ctx.Doc
+        try:
+            el_link = link_doc.GetElement(r.LinkedElementId)
+        except:
+            el_link = None
+        if el_link is None:
+            continue
+
+        ctx.RawElems.append(el_link)
+        link_elems_raw.append(el_link)
+
+    if not link_contexts_dict:
+        TaskDialog.Show(__title__, u"Не удалось получить ни одной валидной связи из выбора.")
+        return
+
+    link_contexts = list(link_contexts_dict.values())
+    kr_link_contexts = []
+    ar_link_contexts = []
+    all_link_struct_elems = []
+
+    for ctx in link_contexts:
+        ctx.Role = classify_link_role(ctx.Inst)
+        struct_elems = [e for e in ctx.RawElems if is_structural_element(e)]
+        ctx.StructElems = [e for e in struct_elems if element_has_target_material(e, ctx.Doc)]
+        all_link_struct_elems.extend(ctx.StructElems)
+
+        if ctx.Role == "KR":
+            kr_link_contexts.append(ctx)
+        else:
+            ar_link_contexts.append(ctx)
+
+    if not all_link_struct_elems:
+        TaskDialog.Show(__title__, u"Среди выбранных элементов в связях нет несущих бетонных/монолитных конструкций.")
+        return
+
+    # 3. Минимальный размер отверстий (+5 мм для надёжного отсечения)
+    min_side_big_mm, min_side_mid_mm = parse_min_opening_size_mm(200.0)
+
+    extra_mm = 5.0  # ← добавляем запас
+    min_side_big_ft = mm_to_ft(min_side_big_mm + extra_mm)
+    min_side_mid_ft = mm_to_ft(min_side_mid_mm + extra_mm)
+
+    # 4. Сбор отверстий
+    host_elem_to_solids = {}
+
+    host_openings_host = collect_openings_from_elements(
+        host_struct_elems,
+        tr_to_host=None,
+        cache_dict=host_elem_to_solids,
+        min_side_big_ft=min_side_big_ft,
+        min_side_mid_ft=min_side_mid_ft
+    )
+
+    kr_openings_links = []
+    ar_openings_links = []
+
+    for ctx in link_contexts:
+        if not ctx.StructElems:
+            continue
+        cache = {}
+        link_opens = collect_openings_from_elements(
+            ctx.StructElems,
+            tr_to_host=ctx.Tr,
+            cache_dict=cache,
+            min_side_big_ft=min_side_big_ft,
+            min_side_mid_ft=min_side_mid_ft
+        )
+        if ctx.Role == "KR":
+            kr_openings_links.extend(link_opens)
+        else:
+            ar_openings_links.extend(link_opens)
+
+    openings_kr = host_openings_host + kr_openings_links
+    openings_ar = ar_openings_links
+
+    unmatched_kr_openings, unmatched_ar_openings = match_openings(
+        openings_kr,
+        openings_ar,
+        POS_TOL_FT,
+        SIZE_TOL_FT
+    )
+
+    total_kr = len(openings_kr)
+    total_ar = len(openings_ar)
+    un_kr    = len(unmatched_kr_openings)
+    un_ar    = len(unmatched_ar_openings)
+
+    opening_points = [o.Center for o in unmatched_kr_openings] + \
+                     [o.Center for o in unmatched_ar_openings]
+
+
+
+    try:
+        if not sym.IsActive:
+            sym.Activate()
+            doc.Regenerate()
+    except Exception as e:
+        TaskDialog.Show(
+            __title__,
+            u"Не удалось активировать семейство 'Точка'.\nОшибка:\n{}".format(e)
+        )
+        return
+
+    created = 0
+
+    if not opening_points:
+        TaskDialog.Show(
+            __title__,
+            u"Несовпадающих отверстий не найдено.\n"
+            u"(Все отверстия удовлетворяют сопоставлению КР vs АР, "
+            u"или попали под термовкладыши/минимальный размер.)"
+        )
+        return
+
+    # 6. Защита от дублей: не ставим точку, если в радиусе 20 мм уже есть 'Точка'
+    bb_raw = make_bbox_from_points(opening_points)
+    bb = grow_bbox(bb_raw, POINT_MATCH_RADIUS_FT)
+
+    existing_locs = []
+    col_existing = (
+        FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_Entourage)
+        .OfClass(FamilyInstance)
+        .ToElements()
+    )
+    for fi in col_existing:
+        try:
+            if fi.Symbol.Id != sym.Id:
+                continue
+        except:
+            continue
+        loc = fi.Location
+        if not isinstance(loc, LocationPoint):
+            continue
+        p = loc.Point
+        if not point_in_bbox(p, bb):
+            continue
+        existing_locs.append(p)
+
+    final_points = []
+    for p_new in opening_points:
+        too_close = False
+        for p_old in existing_locs:
+            dx = p_new.X - p_old.X
+            dy = p_new.Y - p_old.Y
+            dz = p_new.Z - p_old.Z
+            d2 = dx*dx + dy*dy + dz*dz
+            if d2 <= POINT_MATCH_RADIUS2_FT:
+                too_close = True
+                break
+        if not too_close:
+            final_points.append(p_new)
+
+    if final_points:
+        t = Transaction(doc, __title__)
+        t.Start()
+        try:
+            for p in final_points:
+                try:
+                    doc.Create.NewFamilyInstance(
+                        p,
+                        sym,
+                        StructuralType.NonStructural
+                    )
+                    created += 1
+                except:
+                    pass
+            t.Commit()
+        except:
+            t.RollBack()
+
+    # 7. Отчёт
+    print(u"-" * 60)
+    print(u"[ОТВЕРСТИЯ КР vs АР — ТОЧКИ В ЦЕНТРАХ + SAMPLE-ТОЧКИ + ТЕРМОВКЛАДЫШИ]")
+    print(u"Минимальный размер отверстий (фильтр): {:.1f} x {:.1f} мм".format(
+        min_side_big_mm, min_side_mid_mm))
+    print(u"Игнорируем термовкладыши плит (мм): {}".format(THERMO_FLOOR_SIZES_MM))
+    print(u"Игнорируем термовкладыши стен (мм): {}".format(THERMO_WALL_SIZES_MM))
+    print(u"Допуск по размерам термовкладышей:  ±{:.1f} мм".format(THERMO_TOL_MM))
+    print(u"")
+    print(u"Всего отверстий КР (host + КР-линки): {}".format(total_kr))
+    print(u"Всего отверстий АР (АР-линки):        {}".format(total_ar))
+    print(u"Несовпавших отверстий КР:             {}".format(un_kr))
+    print(u"Несовпавших отверстий АР:             {}".format(un_ar))
+    print(u"Создано новых точек 'Точка':          {}".format(created))
+    print(u"-" * 60)
+
+    msg_lines = [
+        u"Минимальный размер отверстий (фильтр): {:.1f} x {:.1f} мм".format(
+            min_side_big_mm, min_side_mid_mm),
+        u"Термовкладыши плит (игнорируем): {} мм, допуск ±{:.1f} мм".format(
+            THERMO_FLOOR_SIZES_MM, THERMO_TOL_MM),
+        u"Термовкладыши стен (игнорируем): {} мм, допуск ±{:.1f} мм".format(
+            THERMO_WALL_SIZES_MM, THERMO_TOL_MM),
+        u"",
+        u"Host КР-элементы (несущие, бетон/монолит): {}".format(len(host_struct_elems)),
+        u"Выбранных link-элементов (все):           {}".format(len(link_elems_raw)),
+        u"Связей КР:                                {}".format(len(kr_link_contexts)),
+        u"Связей АР:                                {}".format(len(ar_link_contexts)),
+        u"",
+        u"Отверстия КР (host + КР-линки): {}".format(total_kr),
+        u"Отверстия АР (АР-линки):        {}".format(total_ar),
+        u"",
+        u"Несовпавшие отверстия КР: {}".format(un_kr),
+        u"Несовпавшие отверстия АР: {}".format(un_ar),
+        u"",
+        u"Создано новых точек 'Точка': {}".format(created),
+        u"",
+        u"Детальный отчёт выведен в консоль pyRevit."
+    ]
+
+    TaskDialog.Show(__title__, u"\n".join(msg_lines))
+
+
+if __name__ == "__main__":
+    main()
