@@ -1,0 +1,288 @@
+# -*- coding: utf-8 -*-
+__title__ = "Проверка по рёбрам (Simple)"
+__doc__   = u"Минимальная версия без offset-точек"
+
+import math
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.DB.Structure import StructuralType
+from Autodesk.Revit.UI.Selection import ObjectType
+from Autodesk.Revit.UI import TaskDialog
+
+doc   = __revit__.ActiveUIDocument.Document
+uidoc = __revit__.ActiveUIDocument
+
+geom_opt = Options()
+geom_opt.IncludeNonVisibleObjects = True
+geom_opt.DetailLevel = ViewDetailLevel.Fine
+
+TOL = 0.001
+STEP = 250.0 / 304.8
+
+
+# ------------------------------------
+# SAFE NAME
+# ------------------------------------
+def safe_name(el):
+    try:
+        return Element.Name.__get__(el)
+    except:
+        try:
+            return el.Name
+        except:
+            return ""
+
+
+# ------------------------------------
+# STRUCTURAL + CONCRETE
+# ------------------------------------
+def is_concrete(elem, rd):
+    try:
+        mats = elem.GetMaterialIds(False)
+    except:
+        mats = []
+    for mid in mats:
+        m = rd.GetElement(mid)
+        if m:
+            n = safe_name(m).lower()
+            if u"бетон" in n or u"монолит" in n:
+                return True
+    return False
+
+
+def is_structural(elem):
+    try:
+        cid = elem.Category.Id.IntegerValue
+        return cid in (
+            int(BuiltInCategory.OST_Walls),
+            int(BuiltInCategory.OST_Floors),
+            int(BuiltInCategory.OST_StructuralColumns),
+            int(BuiltInCategory.OST_StructuralFraming),
+            int(BuiltInCategory.OST_StructuralFoundation)
+        )
+    except:
+        return False
+
+
+# ------------------------------------
+# GET SOLIDS
+# ------------------------------------
+def get_solids(elem):
+    out = []
+    g = elem.get_Geometry(geom_opt)
+    if not g:
+        return out
+    for o in g:
+        if isinstance(o, Solid) and o.Volume > 1e-6:
+            out.append(o)
+        if isinstance(o, GeometryInstance):
+            gi = o.GetInstanceGeometry()
+            for x in gi:
+                if isinstance(x, Solid) and x.Volume > 1e-6:
+                    out.append(x)
+    return out
+
+
+# ------------------------------------
+# BASIC point-in-solid
+# ------------------------------------
+def point_in_solid(p, solid):
+    for face in solid.Faces:
+        try:
+            pr = face.Project(p)
+            if pr and pr.Distance < 0.0001:
+                return True
+        except:
+            pass
+
+    far = XYZ(p.X + 1000, p.Y + 1000, p.Z + 1000)
+    line = Line.CreateBound(p, far)
+    inside = solid.IntersectWithCurve(line, SolidCurveIntersectionOptions()).SegmentCount
+    return inside % 2 == 1
+
+
+# ------------------------------------
+# SAMPLE EDGE
+# ------------------------------------
+def sample_edge(crv):
+    length = crv.Length
+    if length < STEP:
+        return [crv.GetEndPoint(0), crv.GetEndPoint(1)]
+    n = int(length / STEP) + 1
+    pts = []
+    for i in range(n+1):
+        t = float(i)/n
+        pts.append(crv.Evaluate(t, True))
+    return pts
+
+
+# ------------------------------------
+# COLLECT EDGE POINTS (без offset!)
+# ------------------------------------
+def collect_edge_points(solid, transform=None):
+    pts = []
+    verts = []
+
+    for e in solid.Edges:
+        try:
+            c = e.AsCurve()
+            verts.append(c.GetEndPoint(0))
+            verts.append(c.GetEndPoint(1))
+        except:
+            pass
+
+    if not verts:
+        return pts
+
+    xs = [p.X for p in verts]
+    ys = [p.Y for p in verts]
+    zs = [p.Z for p in verts]
+    minX, maxX = min(xs), max(xs)
+    minY, maxY = min(ys), max(ys)
+    minZ, maxZ = min(zs), max(zs)
+
+    for e in solid.Edges:
+        try:
+            crv = e.AsCurve()
+        except:
+            continue
+
+        mid = crv.Evaluate(0.5, True)
+        if transform:
+            mid = transform.OfPoint(mid)
+
+        on_bottom = abs(mid.Z - minZ) <= TOL
+        on_left   = abs(mid.X - minX) <= TOL
+        on_front  = abs(mid.Y - minY) <= TOL
+
+        if not (on_bottom or on_left or on_front):
+            continue
+
+        for p in sample_edge(crv):
+            if transform:
+                p = transform.OfPoint(p)
+            pts.append(p)
+
+    return pts
+
+
+# ------------------------------------
+# MAIN
+# ------------------------------------
+def main():
+
+    # 1. семейство Точка
+    sym = None
+    for s in FilteredElementCollector(doc).OfClass(FamilySymbol):
+        if safe_name(s) == u"Точка" or safe_name(s.Family) == u"Точка":
+            sym = s
+            break
+
+    if not sym:
+        TaskDialog.Show(__title__, u"Нет семейства 'Точка'")
+        return
+
+    if not sym.IsActive:
+        t = Transaction(doc, "Activate")
+        t.Start()
+        sym.Activate()
+        t.Commit()
+
+    # 2. выбор host
+    try:
+        refs_host = uidoc.Selection.PickObjects(ObjectType.Element, "Выберите Host (КР)")
+    except:
+        return
+
+    host = [doc.GetElement(r.ElementId) for r in refs_host]
+    host = [e for e in host if e and is_structural(e) and is_concrete(e, doc)]
+
+    # 3. выбор link
+    try:
+        refs_link = uidoc.Selection.PickObjects(ObjectType.LinkedElement, "Выберите Link (КР+АР)")
+    except:
+        return
+
+    link_ctx = {}
+
+    for r in refs_link:
+        inst = doc.GetElement(r.ElementId)
+        if not isinstance(inst, RevitLinkInstance):
+            continue
+
+        if inst.Id not in link_ctx:
+            d = inst.GetLinkDocument()
+            if not d:
+                continue
+            tr = inst.GetTotalTransform()
+            role = "AR"
+            name = (safe_name(inst) or "") + (d.Title or "")
+            if "kr" in name.lower() or u"кр" in name.lower():
+                role = "KR"
+            link_ctx[inst.Id] = {"doc": d, "tr": tr, "role": role, "elems": []}
+
+        e = link_ctx[inst.Id]["doc"].GetElement(r.LinkedElementId)
+        if e and is_structural(e) and is_concrete(e, link_ctx[inst.Id]["doc"]):
+            link_ctx[inst.Id]["elems"].append(e)
+
+    # 4. собираем точки
+    pts_kr = []
+    pts_ar = []
+
+    # host = KR
+    for el in host:
+        for solid in get_solids(el):
+            pts_kr.extend(collect_edge_points(solid))
+
+    # links
+    for ctx in link_ctx.values():
+        for el in ctx["elems"]:
+            for solid in get_solids(el):
+                pts = collect_edge_points(solid, ctx["tr"])
+                if ctx["role"] == "KR":
+                    pts_kr.extend(pts)
+                else:
+                    pts_ar.extend(pts)
+
+    # 5. симметричная разность
+    kr_solids = []
+    ar_solids = []
+
+    for el in host:
+        kr_solids.extend(get_solids(el))
+
+    for ctx in link_ctx.values():
+        for el in ctx["elems"]:
+            solids = get_solids(el)
+            if ctx["role"] == "KR":
+                kr_solids.extend(solids)
+            else:
+                ar_solids.extend(solids)
+
+    def inside_any(p, solids):
+        for s in solids:
+            if point_in_solid(p, s):
+                return True
+        return False
+
+    pts_kr_final = [p for p in pts_kr if not inside_any(p, ar_solids)]
+    pts_ar_final = [p for p in pts_ar if not inside_any(p, kr_solids)]
+
+    pts_final = pts_kr_final + pts_ar_final
+
+    # 6. создаём точки
+    t = Transaction(doc, "Place points")
+    t.Start()
+    cnt = 0
+    for p in pts_final:
+        try:
+            doc.Create.NewFamilyInstance(p, sym, StructuralType.NonStructural)
+            cnt += 1
+        except:
+            pass
+    t.Commit()
+
+    TaskDialog.Show(__title__, u"Создано точек: {}".format(cnt))
+
+
+if __name__ == "__main__":
+    main()
