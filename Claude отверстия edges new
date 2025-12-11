@@ -157,10 +157,6 @@ FINAL_DEDUP_TOL2_FT = FINAL_DEDUP_TOL_FT * FINAL_DEDUP_TOL_FT
 CLUSTER_TOL_MM = 300.0
 CLUSTER_TOL_FT = mm_to_ft(CLUSTER_TOL_MM)
 
-# Минимальное количество точек расхождения для создания маркера
-# Если меньше этого значения — игнорируем (шум/погрешность моделирования)
-MIN_DIFF_POINTS = 13
-
 # Объединение близких отверстий в группы (кусты)
 OPENING_MERGE_GAP_MM = 150.0
 OPENING_MERGE_GAP_FT = mm_to_ft(OPENING_MERGE_GAP_MM)
@@ -426,19 +422,19 @@ _SOLID_CURVE_OPTS_OUTSIDE.ResultType = SolidCurveIntersectionMode.CurveSegmentsO
 def point_near_solid_face(p, solid, tol_ft=BOUNDARY_TOL_FT):
     if solid is None or solid.Faces.IsEmpty:
         return False
-    
+
     # Ранний выход: проверка bbox солида
     try:
         bb = solid.GetBoundingBox()
         if bb:
             # Точка далеко от bbox — точно не близко к граням
             if (p.X < bb.Min.X - tol_ft or p.X > bb.Max.X + tol_ft or
-                p.Y < bb.Min.Y - tol_ft or p.Y > bb.Max.Y + tol_ft or
-                p.Z < bb.Min.Z - tol_ft or p.Z > bb.Max.Z + tol_ft):
+                    p.Y < bb.Min.Y - tol_ft or p.Y > bb.Max.Y + tol_ft or
+                    p.Z < bb.Min.Z - tol_ft or p.Z > bb.Max.Z + tol_ft):
                 return False
     except:
         pass
-    
+
     for face in solid.Faces:
         try:
             res = face.Project(p)
@@ -937,28 +933,28 @@ def merge_openings_into_groups(openings, gap_ft=OPENING_MERGE_GAP_FT):
     """
     if not openings:
         return []
-    
+
     n = len(openings)
-    
+
     # Union-Find структура
     parent = list(range(n))
-    
+
     def find(x):
         if parent[x] != x:
             parent[x] = find(parent[x])
         return parent[x]
-    
+
     def union(x, y):
         px, py = find(x), find(y)
         if px != py:
             parent[px] = py
-    
+
     # Объединяем только непосредственно близкие отверстия
     for i in range(n):
         for j in range(i + 1, n):
             if openings_bbox_overlap(openings[i], openings[j], gap_ft):
                 union(i, j)
-    
+
     # Собираем группы
     groups_dict = {}
     for i in range(n):
@@ -966,7 +962,7 @@ def merge_openings_into_groups(openings, gap_ft=OPENING_MERGE_GAP_FT):
         if root not in groups_dict:
             groups_dict[root] = []
         groups_dict[root].append(openings[i])
-    
+
     return list(groups_dict.values())
 
 
@@ -977,10 +973,10 @@ def create_merged_opening_from_group(group):
     """
     if not group:
         return None
-    
+
     if len(group) == 1:
         return group[0]
-    
+
     # Объединяем bbox всех отверстий в группе
     all_bb_min_x = min(op.BbMin.X for op in group)
     all_bb_min_y = min(op.BbMin.Y for op in group)
@@ -988,30 +984,30 @@ def create_merged_opening_from_group(group):
     all_bb_max_x = max(op.BbMax.X for op in group)
     all_bb_max_y = max(op.BbMax.Y for op in group)
     all_bb_max_z = max(op.BbMax.Z for op in group)
-    
+
     merged_bb_min = XYZ(all_bb_min_x, all_bb_min_y, all_bb_min_z)
     merged_bb_max = XYZ(all_bb_max_x, all_bb_max_y, all_bb_max_z)
-    
+
     # Центр объединённого bbox
     cx = (all_bb_min_x + all_bb_max_x) / 2
     cy = (all_bb_min_y + all_bb_max_y) / 2
     cz = (all_bb_min_z + all_bb_max_z) / 2
     merged_center = XYZ(cx, cy, cz)
-    
+
     # Размеры
     dx = all_bb_max_x - all_bb_min_x
     dy = all_bb_max_y - all_bb_min_y
     dz = all_bb_max_z - all_bb_min_z
     merged_dims = sorted([dx, dy, dz])
-    
+
     # Берём свойства от первого отверстия в группе
     first = group[0]
-    
+
     # Объединяем вершины всех отверстий (для внешнего контура)
     all_vertices = []
     for op in group:
         all_vertices.extend(op.Vertices)
-    
+
     # Объединяем elem bbox
     elem_bb_min_x = min(op.ElemBbMin.X for op in group if op.ElemBbMin)
     elem_bb_min_y = min(op.ElemBbMin.Y for op in group if op.ElemBbMin)
@@ -1019,10 +1015,10 @@ def create_merged_opening_from_group(group):
     elem_bb_max_x = max(op.ElemBbMax.X for op in group if op.ElemBbMax)
     elem_bb_max_y = max(op.ElemBbMax.Y for op in group if op.ElemBbMax)
     elem_bb_max_z = max(op.ElemBbMax.Z for op in group if op.ElemBbMax)
-    
+
     merged_elem_bb_min = XYZ(elem_bb_min_x, elem_bb_min_y, elem_bb_min_z)
     merged_elem_bb_max = XYZ(elem_bb_max_x, elem_bb_max_y, elem_bb_max_z)
-    
+
     # Создаём объединённое отверстие
     merged = Opening(
         center=merged_center,
@@ -1037,12 +1033,12 @@ def create_merged_opening_from_group(group):
         elem_bb_min=merged_elem_bb_min,
         elem_bb_max=merged_elem_bb_max
     )
-    
-    # Собираем точки из всех оригинальных отверстий, 
+
+    # Собираем точки из всех оригинальных отверстий,
     # но фильтруем те, которые попадают внутрь ДРУГИХ отверстий в группе
     # (это точки на внутренних перемычках)
     merged.SamplePoints = filter_internal_points(group)
-    
+
     return merged
 
 
@@ -1055,14 +1051,14 @@ def point_inside_opening_bbox(p, opening, margin_ft):
 
 def filter_internal_points(group):
     """
-    Собирает точки из всех отверстий группы, 
+    Собирает точки из всех отверстий группы,
     но убирает точки, которые находятся внутри bbox ДРУГОГО отверстия.
     Это фильтрует точки на внутренних перемычках между отверстиями.
     """
     margin_ft = mm_to_ft(20.0)  # небольшой отступ
-    
+
     all_points = []
-    
+
     for i, op in enumerate(group):
         for pt in op.SamplePoints:
             # Проверяем, не попадает ли точка внутрь другого отверстия в группе
@@ -1073,10 +1069,10 @@ def filter_internal_points(group):
                 if point_inside_opening_bbox(pt, other_op, margin_ft):
                     inside_other = True
                     break
-            
+
             if not inside_other:
                 all_points.append(pt)
-    
+
     return all_points
 
 
@@ -1130,7 +1126,7 @@ def check_opening_has_diff(opening, grid_kr, grid_ar, debug=False, all_openings_
     - has_diff: True если есть расхождение
     - result_points: список точек на внешней грани (по одной на кластер)
     - debug_info: информация для отладки
-    
+
     all_openings_in_group: список всех оригинальных отверстий в группе (для фильтрации перемычек)
     """
     # Собираем все точки с их статусом
@@ -1141,7 +1137,7 @@ def check_opening_has_diff(opening, grid_kr, grid_ar, debug=False, all_openings_
     for p in opening.SamplePoints:
         in_kr = grid_kr.is_point_in_any_solid(p)
         in_ar = grid_ar.is_point_in_any_solid(p)
-        
+
         if in_kr and not in_ar:
             kr_yes_ar_no.append(p)
             if debug:
@@ -1157,31 +1153,30 @@ def check_opening_has_diff(opening, grid_kr, grid_ar, debug=False, all_openings_
     # 350мм = 3 шага сетки (300мм) + запас на перемычки до 100мм
     boundary_tol_ft = mm_to_ft(350.0)  # допуск для определения граничной пары
     boundary_tol2 = boundary_tol_ft * boundary_tol_ft
-    
+
     def is_near_opposite(p, opposite_list):
         """Проверяет, есть ли рядом точка с противоположным расхождением"""
         for op in opposite_list:
-            d2 = (p.X - op.X)**2 + (p.Y - op.Y)**2 + (p.Z - op.Z)**2
+            d2 = (p.X - op.X) ** 2 + (p.Y - op.Y) ** 2 + (p.Z - op.Z) ** 2
             if d2 < boundary_tol2:
                 return True
         return False
-    
+
     # Оставляем только точки, у которых НЕТ противоположной пары рядом
     filtered_kr_yes = [p for p in kr_yes_ar_no if not is_near_opposite(p, kr_no_ar_yes)]
     filtered_kr_no = [p for p in kr_no_ar_yes if not is_near_opposite(p, kr_yes_ar_no)]
-    
+
     diff_points = filtered_kr_yes + filtered_kr_no
-    
+
     # Обновляем debug_info только для оставшихся точек
     if debug:
         filtered_set = set()
         for p in diff_points:
             filtered_set.add((round(p.X, 6), round(p.Y, 6), round(p.Z, 6)))
-        debug_info = [(p, kr, ar) for (p, kr, ar) in debug_info 
+        debug_info = [(p, kr, ar) for (p, kr, ar) in debug_info
                       if (round(p.X, 6), round(p.Y, 6), round(p.Z, 6)) in filtered_set]
 
-    # Проверяем минимальное количество точек расхождения
-    if not diff_points or len(diff_points) < MIN_DIFF_POINTS:
+    if not diff_points:
         return False, [], None
 
     # Кластеризуем точки расхождения
@@ -1200,12 +1195,34 @@ def check_opening_has_diff(opening, grid_kr, grid_ar, debug=False, all_openings_
     result_points = []
 
     for cluster in clusters:
-        # Центр кластера — точка внутри отверстия
-        # Используем её и для проверки, и для создания маркера
+        # Центр кластера
         cx = sum(p.X for p in cluster) / len(cluster)
         cy = sum(p.Y for p in cluster) / len(cluster)
         cz = sum(p.Z for p in cluster) / len(cluster)
-        result_points.append(XYZ(cx, cy, cz))
+
+        if opening.IsFloor:
+            # Плита: верхняя грань элемента (max Z плиты + отступ)
+            z_top = elem_bb_max.Z + offset_ft
+            result_point = XYZ(cx, cy, z_top)
+
+        elif opening.IsWall:
+            # Стена: внешняя грань элемента
+            dx = elem_bb_max.X - elem_bb_min.X
+            dy = elem_bb_max.Y - elem_bb_min.Y
+
+            if dx < dy:
+                # Стена тонкая по X → точка на max X (наружу)
+                x_outer = elem_bb_max.X + offset_ft
+                result_point = XYZ(x_outer, cy, cz)
+            else:
+                # Стена тонкая по Y → точка на max Y (наружу)
+                y_outer = elem_bb_max.Y + offset_ft
+                result_point = XYZ(cx, y_outer, cz)
+        else:
+            # Другие элементы: верхняя точка
+            result_point = XYZ(cx, cy, elem_bb_max.Z + offset_ft)
+
+        result_points.append(result_point)
 
     # Формируем debug info
     debug_result = None
@@ -1234,23 +1251,23 @@ def dedup_xyz_list(points, tol2_ft=DEDUP_TOL2_FT):
     """
     if not points:
         return []
-    
+
     tol_ft = math.sqrt(tol2_ft)
     cell_size = tol_ft  # размер ячейки = допуск
-    
+
     result = []
     # Словарь: ключ ячейки -> список точек в этой ячейке
     cells = {}
-    
+
     # Соседние ячейки для проверки (включая диагонали)
     offsets = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)]
-    
+
     for p in points:
         # Индекс ячейки
         ix = int(math.floor(p.X / cell_size))
         iy = int(math.floor(p.Y / cell_size))
         iz = int(math.floor(p.Z / cell_size))
-        
+
         # Проверяем соседние ячейки на наличие дубликатов
         dup = False
         for dx, dy, dz in offsets:
@@ -1261,7 +1278,7 @@ def dedup_xyz_list(points, tol2_ft=DEDUP_TOL2_FT):
                     break
             if dup:
                 break
-        
+
         if not dup:
             result.append(p)
             # Добавляем в ячейку
@@ -1269,7 +1286,7 @@ def dedup_xyz_list(points, tol2_ft=DEDUP_TOL2_FT):
             if key not in cells:
                 cells[key] = []
             cells[key].append(p)
-    
+
     return result
 
 
@@ -1446,7 +1463,8 @@ def main():
     # Проверка наличия элементов АР
     ar_struct_count = sum(len(ctx.StructElems) for ctx in ar_ctxs)
     if ar_struct_count == 0:
-        TaskDialog.Show(__title__, u"Не выбрано ни одного элемента АР.\n\nПодгрузите связи АР и выберите элементы из них.")
+        TaskDialog.Show(__title__,
+                        u"Не выбрано ни одного элемента АР.\n\nПодгрузите связи АР и выберите элементы из них.")
         return
 
     # 1. Параметры отверстий (диапазон размеров)
@@ -1513,34 +1531,13 @@ def main():
     total_ops_kr = len(ops_kr)
     total_ops_ar = len(ops_ar)
 
-    # 5. Сначала объединяем ВПРИТЫК отверстия внутри КР и внутри АР отдельно
-    #    (отверстия которые касаются друг друга, gap=0)
-    #    Это нужно когда одно большое отверстие смоделировано как несколько маленьких впритык
-    touching_gap_ft = mm_to_ft(5.0)  # 5мм допуск на "впритык"
-    
-    # Объединяем впритык в КР
-    kr_groups = merge_openings_into_groups(ops_kr, touching_gap_ft)
-    ops_kr_merged = []
-    for group in kr_groups:
-        merged = create_merged_opening_from_group(group)
-        if merged:
-            ops_kr_merged.append(merged)
-    
-    # Объединяем впритык в АР
-    ar_groups = merge_openings_into_groups(ops_ar, touching_gap_ft)
-    ops_ar_merged = []
-    for group in ar_groups:
-        merged = create_merged_opening_from_group(group)
-        if merged:
-            ops_ar_merged.append(merged)
-
-    # 6. Теперь объединяем КР и АР вместе (с допуском на перемычки)
+    # 5. Объединяем близкие отверстия в группы (кусты)
     #    Это нужно чтобы не считать перемычки между соседними отверстиями как расхождения
-    all_openings_raw = ops_kr_merged + ops_ar_merged
-    
+    all_openings_raw = ops_kr + ops_ar
+
     # Группируем отверстия по близости
     opening_groups = merge_openings_into_groups(all_openings_raw, OPENING_MERGE_GAP_FT)
-    
+
     # Создаём объединённые отверстия из групп
     all_openings = []
     merged_groups_count = 0
@@ -1555,9 +1552,9 @@ def main():
     DEBUG_MODE = False
     # DEBUG: создавать точки прямо в местах расхождений (для визуализации)
     DEBUG_CREATE_DIFF_POINTS = False
-    
+
     openings_with_diff = []
-    diff_points = []  # точки для создания маркеров (центры кластеров внутри отверстий)
+    diff_points = []  # точки для создания маркеров (может быть несколько на отверстие)
     debug_reports = []  # для дебага
     debug_raw_diff_points = []  # сырые точки расхождений для визуализации
 
@@ -1565,7 +1562,7 @@ def main():
         has_diff, result_points, debug_info = check_opening_has_diff(op, grid_kr, grid_ar, debug=DEBUG_MODE)
         if has_diff and result_points:
             openings_with_diff.append(op)
-            diff_points.extend(result_points)  # добавляем точки (центры кластеров внутри отверстий)
+            diff_points.extend(result_points)  # добавляем все точки (по одной на кластер)
             if debug_info:
                 debug_reports.append(debug_info)
                 # Собираем сырые точки расхождений
@@ -1609,46 +1606,12 @@ def main():
     if DEBUG_CREATE_DIFF_POINTS and debug_raw_diff_points:
         print(u"DEBUG: Создаём точки в местах расхождений: {} шт".format(len(debug_raw_diff_points)))
         final_pts = debug_raw_diff_points
-        pts_before_verify = len(final_pts)
-        pts_filtered_by_verify = 0
-        # В дебаг режиме НЕ дедуплицируем и НЕ верифицируем — показываем все точки
+        # В дебаг режиме НЕ дедуплицируем — показываем все точки
     else:
-        # 6. Дедупликация с большим допуском (отверстия из КР и АР близко/совпадают)
-        deduped_pts = dedup_xyz_list(diff_points, FINAL_DEDUP_TOL2_FT)
-
-        # 7. ФИНАЛЬНАЯ ПРОВЕРКА: перепроверяем каждую точку по солидам КР и АР
-        #    Точка внутри отверстия — проверяем и создаём там же
-        pts_before_verify = len(deduped_pts)
-        verified_pts = []
-        
-        if DEBUG_MODE:
-            print(u"")
-            print(u"=" * 60)
-            print(u"DEBUG: Финальная проверка точек")
-            print(u"=" * 60)
-        
-        for p in deduped_pts:
-            in_kr = grid_kr.is_point_in_any_solid(p)
-            in_ar = grid_ar.is_point_in_any_solid(p)
-            has_diff = (in_kr and not in_ar) or (in_ar and not in_kr)
-            
-            if DEBUG_MODE:
-                print(u"  X={:.0f}, Y={:.0f}, Z={:.0f} | КР={} АР={} | diff={}".format(
-                    p.X * 304.8, p.Y * 304.8, p.Z * 304.8,
-                    u"ДА" if in_kr else u"НЕТ",
-                    u"ДА" if in_ar else u"НЕТ",
-                    u"ДА" if has_diff else u"НЕТ"))
-            
-            if has_diff:
-                verified_pts.append(p)
-        
-        if DEBUG_MODE:
-            print(u"")
-            print(u"Прошло проверку: {} из {}".format(len(verified_pts), pts_before_verify))
-            print(u"=" * 60)
-        
-        pts_filtered_by_verify = pts_before_verify - len(verified_pts)
-        final_pts = verified_pts
+        # 6. Используем реальные точки внутри отверстий
+        final_pts = diff_points
+        # Дедупликация с большим допуском (отверстия из КР и АР близко/совпадают)
+        final_pts = dedup_xyz_list(final_pts, FINAL_DEDUP_TOL2_FT)
 
     if not final_pts:
         TaskDialog.Show(__title__, u"После проверки отверстий расхождений не найдено.\n"
@@ -1821,12 +1784,9 @@ def main():
         u"Объединено в групп (кустов): {}".format(merged_groups_count),
         u"Всего отверстий/групп для проверки: {}".format(len(all_openings)),
         u"",
-        u"Мин. точек расхождения для маркера: {}".format(MIN_DIFF_POINTS),
         u"Отверстий с расхождением по бетону: {}".format(len(openings_with_diff)),
         u"Порог кластеризации: {:.0f} мм".format(CLUSTER_TOL_MM),
         u"",
-        u"Точек до финальной проверки: {}".format(pts_before_verify),
-        u"Отсеяно финальной проверкой: {}".format(pts_filtered_by_verify),
         u"Точек для создания: {}".format(len(final_pts)),
         u"",
         u"Новых точек создано: {}".format(cnt_create),
