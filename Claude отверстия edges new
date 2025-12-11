@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
-__title__ = "Проверка монолита"
-__doc__ = u"""Version = 8.0+voxelgrid
-Оптимизированная версия (Voxel Grid).
-Симметричная разность КР vs АР в зоне выбранных элементов
-+ сравнение отверстий (внутренние лупы < 1000 мм)
-+ поддержка нескольких RevitLinkInstance
-+ Voxel Grid ускорение (x10-x100 на больших моделях)
-+ финальная проверка «несовпавших» отверстий по бетону (несколько точек внутри проёма).
+__title__ = "Проверка отверстий"
+__doc__ = u"""Version = 1.0
+Проверка только отверстий (закрытых внутренних лупов).
+Точки внутри отверстий проверяются на наличие в бетоне КР vs АР.
 """
 
 import clr
@@ -148,19 +144,32 @@ POINT_MATCH_RADIUS_MM = 50.0
 POINT_MATCH_RADIUS_FT = mm_to_ft(POINT_MATCH_RADIUS_MM)
 POINT_MATCH_RADIUS2_FT = POINT_MATCH_RADIUS_FT * POINT_MATCH_RADIUS_FT
 
-GRID_STEP_MIN_MM = 500.0
-GRID_STEP_MAX_MM = 1000.0
-GRID_STEP_MIN_FT = mm_to_ft(GRID_STEP_MIN_MM)
-GRID_STEP_MAX_FT = mm_to_ft(GRID_STEP_MAX_MM)
-
 DEDUP_TOL_MM = 1.0
 DEDUP_TOL_FT = mm_to_ft(DEDUP_TOL_MM)
 DEDUP_TOL2_FT = DEDUP_TOL_FT * DEDUP_TOL_FT
 
-PROEM_SIDE_MM = 1000.0
-PROEM_SIDE_FT = mm_to_ft(PROEM_SIDE_MM)
-PROEM_STEP_MM = 300.0
+# Дедупликация финальных точек (отверстия КР и АР могут совпадать)
+FINAL_DEDUP_TOL_MM = 400.0
+FINAL_DEDUP_TOL_FT = mm_to_ft(FINAL_DEDUP_TOL_MM)
+FINAL_DEDUP_TOL2_FT = FINAL_DEDUP_TOL_FT * FINAL_DEDUP_TOL_FT
 
+# Порог кластеризации расхождений внутри одного отверстия
+CLUSTER_TOL_MM = 300.0
+CLUSTER_TOL_FT = mm_to_ft(CLUSTER_TOL_MM)
+
+# Минимальное количество точек расхождения для создания маркера
+# Если меньше этого значения — игнорируем (шум/погрешность моделирования)
+MIN_DIFF_POINTS = 13
+
+# Объединение близких отверстий в группы (кусты)
+OPENING_MERGE_GAP_MM = 150.0
+OPENING_MERGE_GAP_FT = mm_to_ft(OPENING_MERGE_GAP_MM)
+
+# Максимальный размер отверстия (по умолчанию, можно изменить в диалоге)
+DEFAULT_MAX_OPENING_SIZE_MM = 2000.0
+MAX_OPENING_SIZE_FT = mm_to_ft(DEFAULT_MAX_OPENING_SIZE_MM)
+
+# Термовкладыши - исключаем
 THERMO_TOL_MM = 20.0
 THERMO_TOL_FT = mm_to_ft(THERMO_TOL_MM)
 
@@ -173,9 +182,9 @@ THERMO_WALL_SIZES_FT = [(mm_to_ft(a), mm_to_ft(b)) for (a, b) in THERMO_WALL_SIZ
 VOXEL_CELL_MM = 1500.0
 VOXEL_CELL_FT = mm_to_ft(VOXEL_CELL_MM)
 
-# параметры выборки внутри отверстий
-OPENING_OFFSET_MM = 50.0
-OPENING_STEP_MM = 200.0
+# Параметры выборки внутри отверстий
+OPENING_OFFSET_MM = 30.0  # отступ от краёв
+OPENING_STEP_MM = 100.0  # шаг сетки для проверки
 
 # ---------- ПАРАМЕТРЫ СЕМЕЙСТВА 'ТОЧКА' ----------
 
@@ -248,34 +257,44 @@ def set_point_material_by_status(fi, status_text):
 
 # ---------- UI ----------
 
-def parse_min_opening_size_mm(default_mm=200.0):
+def parse_opening_size_range_mm(default_min=200.0, default_max=2000.0):
+    """Запрашивает у пользователя диапазон размеров отверстий."""
     try:
         s = forms.ask_for_string(
-            prompt=u"Минимальный общий размер отверстий (мм).\nПо умолчанию: {0}x{0} мм.\n0 для отключения.".format(
-                int(default_mm)),
-            title=__title__, default=str(int(default_mm))
+            prompt=u"Диапазон размеров отверстий (мм).\n"
+                   u"Формат: МИН-МАКС (например: 200-2000)\n"
+                   u"По умолчанию: {}-{} мм".format(int(default_min), int(default_max)),
+            title=__title__,
+            default=u"{}-{}".format(int(default_min), int(default_max))
         )
     except:
         s = None
     if s is None:
-        return default_mm, default_mm
+        return default_min, default_max
     s = s.strip()
     if not s:
-        return default_mm, default_mm
-    s = s.lower().replace(u'×', 'x').replace('*', 'x').replace(' ', '')
-    parts = s.split('x')
-    nums = []
-    for p in parts:
-        try:
-            v = float(p.replace(',', '.'))
-            nums.append(max(0.0, v))
-        except:
-            pass
-    if not nums:
-        return default_mm, default_mm
-    if len(nums) == 1:
-        return nums[0], nums[0]
-    return nums[0], nums[1]
+        return default_min, default_max
+
+    # Парсим формат "MIN-MAX" или "MIN - MAX"
+    s = s.replace(' ', '')
+    if '-' in s:
+        parts = s.split('-')
+        if len(parts) >= 2:
+            try:
+                min_val = float(parts[0].replace(',', '.'))
+                max_val = float(parts[1].replace(',', '.'))
+                return max(0.0, min_val), max(min_val, max_val)
+            except:
+                pass
+
+    # Если не удалось распарсить как диапазон, пробуем как одно число (мин)
+    try:
+        v = float(s.replace(',', '.'))
+        return max(0.0, v), default_max
+    except:
+        pass
+
+    return default_min, default_max
 
 
 # ---------- GEOMETRY UTILS ----------
@@ -337,24 +356,6 @@ def get_first_valid_solid(elem, cache_dict=None):
     return solids[0] if solids else None
 
 
-def get_volume_m3_from_solid(solid):
-    try:
-        return solid.Volume * FT3_TO_M3
-    except:
-        return 0.0
-
-
-def get_random_count_for_volume_m3(vol_m3):
-    """Возвращает количество внутренних точек для солидов по объёму, м³."""
-    if vol_m3 <= 0:
-        return 0
-    elif vol_m3 < 0.5:
-        return 10
-    else:
-        # очень крупные элементы - не раздуваем до бесконечности
-        return 30
-
-
 def get_solid_vertices(solid, tol=1e-6):
     if solid is None:
         return []
@@ -414,9 +415,30 @@ def point_in_bbox(p, bb):
 
 # ---------- POINT-IN-SOLID ----------
 
+# Глобальные опции для IntersectWithCurve (создаём один раз)
+_SOLID_CURVE_OPTS_INSIDE = SolidCurveIntersectionOptions()
+_SOLID_CURVE_OPTS_INSIDE.ResultType = SolidCurveIntersectionMode.CurveSegmentsInside
+
+_SOLID_CURVE_OPTS_OUTSIDE = SolidCurveIntersectionOptions()
+_SOLID_CURVE_OPTS_OUTSIDE.ResultType = SolidCurveIntersectionMode.CurveSegmentsOutside
+
+
 def point_near_solid_face(p, solid, tol_ft=BOUNDARY_TOL_FT):
     if solid is None or solid.Faces.IsEmpty:
         return False
+    
+    # Ранний выход: проверка bbox солида
+    try:
+        bb = solid.GetBoundingBox()
+        if bb:
+            # Точка далеко от bbox — точно не близко к граням
+            if (p.X < bb.Min.X - tol_ft or p.X > bb.Max.X + tol_ft or
+                p.Y < bb.Min.Y - tol_ft or p.Y > bb.Max.Y + tol_ft or
+                p.Z < bb.Min.Z - tol_ft or p.Z > bb.Max.Z + tol_ft):
+                return False
+    except:
+        pass
+    
     for face in solid.Faces:
         try:
             res = face.Project(p)
@@ -432,11 +454,8 @@ def point_in_solid_strict(p, solid):
         return False
     far = XYZ(p.X + 9999.0, p.Y + 9999.0, p.Z + 9999.0)
     line = Line.CreateBound(p, far)
-    opts = SolidCurveIntersectionOptions()
-    opts.ResultType = SolidCurveIntersectionMode.CurveSegmentsInside
-    inside = solid.IntersectWithCurve(line, opts).SegmentCount
-    opts.ResultType = SolidCurveIntersectionMode.CurveSegmentsOutside
-    outside = solid.IntersectWithCurve(line, opts).SegmentCount
+    inside = solid.IntersectWithCurve(line, _SOLID_CURVE_OPTS_INSIDE).SegmentCount
+    outside = solid.IntersectWithCurve(line, _SOLID_CURVE_OPTS_OUTSIDE).SegmentCount
     return ((inside + outside) % 2) == 0
 
 
@@ -521,89 +540,741 @@ class VoxelGrid(object):
         return False
 
 
-# ---------- GENERATORS & FILTERS ----------
+# ---------- OPENINGS ----------
 
-def generate_grid_points_in_bbox(bb, target_count):
+class Opening(object):
+    """Класс для хранения информации об отверстии."""
+
+    def __init__(self, center, dims_sorted, element, bb_min, bb_max, source_role, vertices=None, is_floor=False,
+                 is_wall=False, elem_bb_min=None, elem_bb_max=None):
+        self.Center = center  # геометрический центр отверстия (в host координатах)
+        self.DimsSorted = dims_sorted  # размеры [min, mid, max]
+        # Поддержка передачи как element, так и element_id напрямую
+        if hasattr(element, 'Id'):
+            self.ElementId = element.Id
+        else:
+            self.ElementId = element  # уже ElementId
+        self.BbMin = bb_min  # bbox отверстия в host координатах
+        self.BbMax = bb_max  # bbox отверстия в host координатах
+        self.SourceRole = source_role  # "KR" или "AR"
+        self.Vertices = vertices or []  # вершины отверстия (в host координатах)
+        self.IsFloor = is_floor  # это плита
+        self.IsWall = is_wall  # это стена
+        self.ElemBbMin = elem_bb_min  # bbox элемента (плиты/стены)
+        self.ElemBbMax = elem_bb_max  # bbox элемента (плиты/стены)
+        self.SamplePoints = []  # точки внутри отверстия для проверки
+
+
+def is_thermo_size(side_big, side_mid, size_pairs, tol):
+    """Проверка на термовкладыш по размерам."""
+    for b, m in size_pairs:
+        if (abs(side_big - b) <= tol and abs(side_mid - m) <= tol) or \
+                (abs(side_big - m) <= tol and abs(side_mid - b) <= tol):
+            return True
+    return False
+
+
+def generate_grid_points_in_opening(opening, offset_mm=OPENING_OFFSET_MM, step_mm=OPENING_STEP_MM):
+    """
+    Генерирует точки для проверки отверстия:
+    1. Сетка точек внутри bbox
+    2. Точки около вершин (с небольшим отступом внутрь)
+    """
+    offset_ft = mm_to_ft(offset_mm)
+    step_ft = mm_to_ft(step_mm)
+    vertex_offset_ft = mm_to_ft(30.0)  # отступ от вершины внутрь отверстия
+
+    bb_min = opening.BbMin
+    bb_max = opening.BbMax
+
+    dx = bb_max.X - bb_min.X
+    dy = bb_max.Y - bb_min.Y
+    dz = bb_max.Z - bb_min.Z
+
+    # Центр отверстия
+    cx = (bb_min.X + bb_max.X) / 2
+    cy = (bb_min.Y + bb_max.Y) / 2
+    cz = (bb_min.Z + bb_max.Z) / 2
+    center = XYZ(cx, cy, cz)
+
+    # Определяем, какая ось "тонкая" (толщина плиты/стены)
+    thin_threshold_ft = mm_to_ft(50.0)
+
+    is_thin_x = dx < thin_threshold_ft
+    is_thin_y = dy < thin_threshold_ft
+    is_thin_z = dz < thin_threshold_ft
+
     pts = []
-    if not bb or target_count <= 0:
-        return pts
-    dx = bb.Max.X - bb.Min.X
-    dy = bb.Max.Y - bb.Min.Y
-    dz = bb.Max.Z - bb.Min.Z
-    if dx <= 0 or dy <= 0 or dz <= 0:
-        return pts
-    vol_box = dx * dy * dz
-    cell_vol = vol_box / float(target_count)
-    base_step = max(GRID_STEP_MIN_FT, min(GRID_STEP_MAX_FT, cell_vol ** (1.0 / 3.0)))
-    nx = max(1, int(dx / base_step))
-    ny = max(1, int(dy / base_step))
-    nz = max(1, int(dz / base_step))
-    step_x = dx / nx
-    step_y = dy / ny
-    step_z = dz / nz
-    for ix in range(nx):
-        x = bb.Min.X + (ix + 0.5) * step_x
-        for iy in range(ny):
-            y = bb.Min.Y + (iy + 0.5) * step_y
-            for iz in range(nz):
-                z = bb.Min.Z + (iz + 0.5) * step_z
-                pts.append(XYZ(x, y, z))
+
+    # === 1. Точки около вершин (с отступом к центру) ===
+    if opening.Vertices:
+        for v in opening.Vertices:
+            # Вектор от вершины к центру
+            to_center_x = cx - v.X
+            to_center_y = cy - v.Y
+            to_center_z = cz - v.Z
+
+            # Нормализуем (длина вектора)
+            length = math.sqrt(to_center_x ** 2 + to_center_y ** 2 + to_center_z ** 2)
+            if length > 1e-6:
+                # Сдвигаем вершину к центру на vertex_offset
+                offset_x = (to_center_x / length) * vertex_offset_ft
+                offset_y = (to_center_y / length) * vertex_offset_ft
+                offset_z = (to_center_z / length) * vertex_offset_ft
+
+                pt = XYZ(v.X + offset_x, v.Y + offset_y, v.Z + offset_z)
+                pts.append(pt)
+            else:
+                pts.append(v)
+
+    # === 2. Сетка точек внутри bbox ===
+    # Границы с учётом отступа (только для "толстых" осей)
+    if is_thin_x:
+        min_x = max_x = cx
+    else:
+        min_x = bb_min.X + offset_ft
+        max_x = bb_max.X - offset_ft
+
+    if is_thin_y:
+        min_y = max_y = cy
+    else:
+        min_y = bb_min.Y + offset_ft
+        max_y = bb_max.Y - offset_ft
+
+    if is_thin_z:
+        min_z = max_z = cz
+    else:
+        min_z = bb_min.Z + offset_ft
+        max_z = bb_max.Z - offset_ft
+
+    # Проверяем, что после отступа есть место для сетки
+    has_grid = True
+    if (not is_thin_x and min_x >= max_x) or \
+            (not is_thin_y and min_y >= max_y) or \
+            (not is_thin_z and min_z >= max_z):
+        has_grid = False
+
+    if has_grid:
+        # Вычисляем шаги
+        range_x = max_x - min_x
+        range_y = max_y - min_y
+        range_z = max_z - min_z
+
+        nx = max(1, int(math.ceil(range_x / step_ft))) if range_x > 0 else 1
+        ny = max(1, int(math.ceil(range_y / step_ft))) if range_y > 0 else 1
+        nz = max(1, int(math.ceil(range_z / step_ft))) if range_z > 0 else 1
+
+        step_x = range_x / nx if nx > 1 else 0
+        step_y = range_y / ny if ny > 1 else 0
+        step_z = range_z / nz if nz > 1 else 0
+
+        for ix in range(nx + 1 if range_x > 0 else 1):
+            x = min_x + ix * step_x if step_x > 0 else min_x
+            for iy in range(ny + 1 if range_y > 0 else 1):
+                y = min_y + iy * step_y if step_y > 0 else min_y
+                for iz in range(nz + 1 if range_z > 0 else 1):
+                    z = min_z + iz * step_z if step_z > 0 else min_z
+                    pts.append(XYZ(x, y, z))
+
+    # Если совсем нет точек - хотя бы центр
+    if not pts:
+        pts.append(center)
+
     return pts
 
 
-def sample_points_in_solid(elem, solid, count):
-    pts = []
-    bb = elem.get_BoundingBox(None) if elem else None
-    if not bb and solid:
-        bb = solid.GetBoundingBox()
-    if not bb or count <= 0:
-        return pts
-    grid_pts = generate_grid_points_in_bbox(bb, count)
-    for p in grid_pts:
-        if point_in_solid_strict(p, solid):
-            pts.append(p)
-    return pts
+def get_opening_top_point(opening, offset_mm=OPENING_OFFSET_MM):
+    """
+    Возвращает одну точку для размещения маркера —
+    в центре XY, на верхней грани (max Z) с небольшим отступом внутрь.
+    """
+    offset_ft = mm_to_ft(offset_mm)
+
+    bb_min = opening.BbMin
+    bb_max = opening.BbMax
+
+    # Центр по X и Y
+    cx = (bb_min.X + bb_max.X) / 2
+    cy = (bb_min.Y + bb_max.Y) / 2
+
+    # Верхняя грань по Z (с небольшим отступом вниз, чтобы точка была внутри)
+    dz = bb_max.Z - bb_min.Z
+    thin_threshold_ft = mm_to_ft(50.0)
+
+    if dz < thin_threshold_ft:
+        # Плоское отверстие - Z в центре
+        z = (bb_min.Z + bb_max.Z) / 2
+    else:
+        # 3D отверстие - верхняя грань с отступом
+        z = bb_max.Z - offset_ft
+        if z < bb_min.Z:
+            z = (bb_min.Z + bb_max.Z) / 2
+
+    return XYZ(cx, cy, z)
 
 
-def sample_points_in_link_solid_host(solid_link_local, link_tr, count, bb_local=None):
-    pts_host = []
-    if not solid_link_local or count <= 0:
-        return pts_host
-    if not bb_local:
-        bb_local = make_bbox_from_points(get_solid_vertices(solid_link_local))
-    if not bb_local:
-        return pts_host
-    grid_pts_local = generate_grid_points_in_bbox(bb_local, count)
-    for p_local in grid_pts_local:
-        if point_in_solid_strict(p_local, solid_link_local):
-            pts_host.append(link_tr.OfPoint(p_local))
-    try:
-        centroid = solid_link_local.ComputeCentroid()
-    except:
-        centroid = None
-    if centroid:
-        c_host = link_tr.OfPoint(centroid)
-        if not any(p.IsAlmostEqualTo(c_host) for p in pts_host):
-            pts_host.append(c_host)
-    return pts_host
+def collect_openings_from_elements(elems, tr_to_host, cache_dict, source_role,
+                                   min_side_big_ft=0, min_side_mid_ft=0,
+                                   max_side_ft=MAX_OPENING_SIZE_FT,
+                                   debug=False):
+    """
+    Собирает отверстия (внутренние лупы) из элементов.
+    Возвращает список объектов Opening с уже заполненными SamplePoints.
+    """
+    openings = []
+
+    # Счётчики для диагностики
+    total_loops_found = 0
+    skipped_few_verts = 0
+    skipped_wall_top_bottom = 0
+    skipped_too_big = 0
+    skipped_thermo = 0
+    skipped_too_small = 0
+
+    for el in elems:
+        solids = get_cached_solids(el, cache_dict) if cache_dict else get_all_solids(el)
+        if not solids:
+            continue
+
+        is_wall = (el.Category.Id.IntegerValue == int(BuiltInCategory.OST_Walls)) if el.Category else False
+        is_floor = (el.Category.Id.IntegerValue == int(BuiltInCategory.OST_Floors)) if el.Category else False
+
+        bb = el.get_BoundingBox(None)
+        z_min, z_max = (bb.Min.Z, bb.Max.Z) if bb else (None, None)
+
+        for solid in solids:
+            if not solid.Faces:
+                continue
+
+            for face in solid.Faces:
+                loops = face.EdgeLoops
+                if not loops or loops.Size < 2:
+                    continue
+
+                # Перебираем внутренние лупы (индекс 0 - внешний контур)
+                for li in range(1, loops.Size):
+                    loop = loops[li]
+                    total_loops_found += 1
+                    verts_local = []
+                    verts_host = []
+
+                    for edge in loop:
+                        try:
+                            c = edge.AsCurve()
+                        except:
+                            continue
+                        if not c:
+                            continue
+
+                        p0_local = c.GetEndPoint(0)
+                        p1_local = c.GetEndPoint(1)
+
+                        verts_local.extend([p0_local, p1_local])
+
+                        if tr_to_host:
+                            p0 = tr_to_host.OfPoint(p0_local)
+                            p1 = tr_to_host.OfPoint(p1_local)
+                        else:
+                            p0 = p0_local
+                            p1 = p1_local
+
+                        verts_host.extend([p0, p1])
+
+                    if len(verts_host) < 6:
+                        skipped_few_verts += 1
+                        if debug:
+                            print(u"  [SKIP] Loop {} verts < 6: {} verts".format(li, len(verts_host)))
+                        continue
+
+                    xs = [p.X for p in verts_host]
+                    ys = [p.Y for p in verts_host]
+                    zs = [p.Z for p in verts_host]
+
+                    center = XYZ(sum(xs) / len(verts_host),
+                                 sum(ys) / len(verts_host),
+                                 sum(zs) / len(verts_host))
+
+                    # Фильтр: исключаем верхние/нижние грани стен
+                    if is_wall and z_min is not None:
+                        if abs(center.Z - z_min) <= BBOX_FACE_TOL_FT or \
+                                abs(center.Z - z_max) <= BBOX_FACE_TOL_FT:
+                            skipped_wall_top_bottom += 1
+                            continue
+
+                    dx = max(xs) - min(xs)
+                    dy = max(ys) - min(ys)
+                    dz = max(zs) - min(zs)
+                    dims = sorted([dx, dy, dz])
+                    mid = dims[1]
+                    big = dims[2]
+
+                    if debug:
+                        print(u"  Loop {}: verts={}, dims={:.0f}x{:.0f}x{:.0f} mm".format(
+                            li, len(verts_host),
+                            big * 304.8, mid * 304.8, dims[0] * 304.8))
+
+                    # Фильтр по максимальному размеру (это отверстие, не проём)
+                    if big >= max_side_ft:
+                        skipped_too_big += 1
+                        if debug:
+                            print(u"    [SKIP] Too big: {:.0f} >= {:.0f} mm".format(big * 304.8, max_side_ft * 304.8))
+                        continue
+
+                    # Фильтр термовкладышей
+                    if is_floor and is_thermo_size(big, mid, THERMO_FLOOR_SIZES_FT, THERMO_TOL_FT):
+                        skipped_thermo += 1
+                        continue
+                    if is_wall and is_thermo_size(big, mid, THERMO_WALL_SIZES_FT, THERMO_TOL_FT):
+                        skipped_thermo += 1
+                        continue
+
+                    # Фильтр по минимальному размеру
+                    if min_side_big_ft > 0 or min_side_mid_ft > 0:
+                        if big <= min_side_big_ft and mid <= min_side_mid_ft:
+                            skipped_too_small += 1
+                            if debug:
+                                print(u"    [SKIP] Too small")
+                            continue
+
+                    bb_min = XYZ(min(xs), min(ys), min(zs))
+                    bb_max = XYZ(max(xs), max(ys), max(zs))
+
+                    # Убираем дубликаты вершин (каждая точка встречается дважды как конец двух рёбер)
+                    unique_verts = []
+                    seen = set()
+                    for v in verts_host:
+                        key = (round(v.X * 1000), round(v.Y * 1000), round(v.Z * 1000))
+                        if key not in seen:
+                            seen.add(key)
+                            unique_verts.append(v)
+
+                    # BBox элемента (плиты/стены) в host координатах
+                    if bb and tr_to_host:
+                        # Трансформируем bbox элемента из линка в host
+                        elem_bb_min = tr_to_host.OfPoint(bb.Min)
+                        elem_bb_max = tr_to_host.OfPoint(bb.Max)
+                    elif bb:
+                        elem_bb_min = bb.Min
+                        elem_bb_max = bb.Max
+                    else:
+                        elem_bb_min = bb_min
+                        elem_bb_max = bb_max
+
+                    op = Opening(center, dims, el, bb_min, bb_max, source_role, unique_verts, is_floor, is_wall,
+                                 elem_bb_min, elem_bb_max)
+
+                    # Генерируем точки внутри отверстия
+                    op.SamplePoints = generate_grid_points_in_opening(op)
+
+                    if debug:
+                        print(u"    [OK] Added opening, {} sample points".format(len(op.SamplePoints)))
+
+                    openings.append(op)
+
+    if debug:
+        print(u"")
+        print(u"=== {} summary ===".format(source_role))
+        print(u"  Total inner loops found: {}".format(total_loops_found))
+        print(u"  Skipped (few verts): {}".format(skipped_few_verts))
+        print(u"  Skipped (wall top/bottom): {}".format(skipped_wall_top_bottom))
+        print(u"  Skipped (too big >= 1000mm): {}".format(skipped_too_big))
+        print(u"  Skipped (thermo): {}".format(skipped_thermo))
+        print(u"  Skipped (too small): {}".format(skipped_too_small))
+        print(u"  Final openings: {}".format(len(openings)))
+
+    return openings
 
 
-def dedup_xyz_list(points, tol2_ft=DEDUP_TOL2_FT):
+def match_openings(kr_openings, ar_openings, pos_tol, size_tol):
+    """
+    Матчинг отверстий КР vs АР по позиции и размерам.
+    Возвращает: (unmatched_kr, unmatched_ar)
+    """
+    unmatched_kr = []
+    used_ar = set()
+
+    for h in kr_openings:
+        match = None
+        for idx, l in enumerate(ar_openings):
+            if idx in used_ar:
+                continue
+            dist = h.Center.DistanceTo(l.Center)
+            if dist > pos_tol:
+                continue
+            if abs(h.DimsSorted[1] - l.DimsSorted[1]) > size_tol or \
+                    abs(h.DimsSorted[2] - l.DimsSorted[2]) > size_tol:
+                continue
+            match = idx
+            break
+        if match is None:
+            unmatched_kr.append(h)
+        else:
+            used_ar.add(match)
+
+    unmatched_ar = [l for i, l in enumerate(ar_openings) if i not in used_ar]
+    return unmatched_kr, unmatched_ar
+
+
+def openings_bbox_overlap(op1, op2, gap_ft):
+    """
+    Проверяет, пересекаются ли bbox двух отверстий с учётом зазора.
+    Возвращает True если bbox перекрываются или находятся ближе gap_ft.
+    """
+    # Расширяем bbox1 на gap_ft и проверяем пересечение с bbox2
+    return not (op1.BbMax.X + gap_ft < op2.BbMin.X or
+                op1.BbMin.X - gap_ft > op2.BbMax.X or
+                op1.BbMax.Y + gap_ft < op2.BbMin.Y or
+                op1.BbMin.Y - gap_ft > op2.BbMax.Y or
+                op1.BbMax.Z + gap_ft < op2.BbMin.Z or
+                op1.BbMin.Z - gap_ft > op2.BbMax.Z)
+
+
+def merge_openings_into_groups(openings, gap_ft=OPENING_MERGE_GAP_FT):
+    """
+    Объединяет близкие отверстия в группы.
+    Используем Union-Find для корректной группировки без "цепочек через всю модель".
+    Объединяем только отверстия, которые непосредственно близки друг к другу.
+    """
+    if not openings:
+        return []
+    
+    n = len(openings)
+    
+    # Union-Find структура
+    parent = list(range(n))
+    
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+    
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+    
+    # Объединяем только непосредственно близкие отверстия
+    for i in range(n):
+        for j in range(i + 1, n):
+            if openings_bbox_overlap(openings[i], openings[j], gap_ft):
+                union(i, j)
+    
+    # Собираем группы
+    groups_dict = {}
+    for i in range(n):
+        root = find(i)
+        if root not in groups_dict:
+            groups_dict[root] = []
+        groups_dict[root].append(openings[i])
+    
+    return list(groups_dict.values())
+
+
+def create_merged_opening_from_group(group):
+    """
+    Создаёт одно объединённое "отверстие" из группы близких отверстий.
+    Использует общий bbox группы.
+    """
+    if not group:
+        return None
+    
+    if len(group) == 1:
+        return group[0]
+    
+    # Объединяем bbox всех отверстий в группе
+    all_bb_min_x = min(op.BbMin.X for op in group)
+    all_bb_min_y = min(op.BbMin.Y for op in group)
+    all_bb_min_z = min(op.BbMin.Z for op in group)
+    all_bb_max_x = max(op.BbMax.X for op in group)
+    all_bb_max_y = max(op.BbMax.Y for op in group)
+    all_bb_max_z = max(op.BbMax.Z for op in group)
+    
+    merged_bb_min = XYZ(all_bb_min_x, all_bb_min_y, all_bb_min_z)
+    merged_bb_max = XYZ(all_bb_max_x, all_bb_max_y, all_bb_max_z)
+    
+    # Центр объединённого bbox
+    cx = (all_bb_min_x + all_bb_max_x) / 2
+    cy = (all_bb_min_y + all_bb_max_y) / 2
+    cz = (all_bb_min_z + all_bb_max_z) / 2
+    merged_center = XYZ(cx, cy, cz)
+    
+    # Размеры
+    dx = all_bb_max_x - all_bb_min_x
+    dy = all_bb_max_y - all_bb_min_y
+    dz = all_bb_max_z - all_bb_min_z
+    merged_dims = sorted([dx, dy, dz])
+    
+    # Берём свойства от первого отверстия в группе
+    first = group[0]
+    
+    # Объединяем вершины всех отверстий (для внешнего контура)
+    all_vertices = []
+    for op in group:
+        all_vertices.extend(op.Vertices)
+    
+    # Объединяем elem bbox
+    elem_bb_min_x = min(op.ElemBbMin.X for op in group if op.ElemBbMin)
+    elem_bb_min_y = min(op.ElemBbMin.Y for op in group if op.ElemBbMin)
+    elem_bb_min_z = min(op.ElemBbMin.Z for op in group if op.ElemBbMin)
+    elem_bb_max_x = max(op.ElemBbMax.X for op in group if op.ElemBbMax)
+    elem_bb_max_y = max(op.ElemBbMax.Y for op in group if op.ElemBbMax)
+    elem_bb_max_z = max(op.ElemBbMax.Z for op in group if op.ElemBbMax)
+    
+    merged_elem_bb_min = XYZ(elem_bb_min_x, elem_bb_min_y, elem_bb_min_z)
+    merged_elem_bb_max = XYZ(elem_bb_max_x, elem_bb_max_y, elem_bb_max_z)
+    
+    # Создаём объединённое отверстие
+    merged = Opening(
+        center=merged_center,
+        dims_sorted=merged_dims,
+        element=first.ElementId,  # берём от первого (для совместимости)
+        bb_min=merged_bb_min,
+        bb_max=merged_bb_max,
+        source_role=first.SourceRole,
+        vertices=all_vertices,
+        is_floor=first.IsFloor,
+        is_wall=first.IsWall,
+        elem_bb_min=merged_elem_bb_min,
+        elem_bb_max=merged_elem_bb_max
+    )
+    
+    # Собираем точки из всех оригинальных отверстий, 
+    # но фильтруем те, которые попадают внутрь ДРУГИХ отверстий в группе
+    # (это точки на внутренних перемычках)
+    merged.SamplePoints = filter_internal_points(group)
+    
+    return merged
+
+
+def point_inside_opening_bbox(p, opening, margin_ft):
+    """Проверяет, находится ли точка внутри bbox отверстия (с отступом)."""
+    return (opening.BbMin.X + margin_ft <= p.X <= opening.BbMax.X - margin_ft and
+            opening.BbMin.Y + margin_ft <= p.Y <= opening.BbMax.Y - margin_ft and
+            opening.BbMin.Z + margin_ft <= p.Z <= opening.BbMax.Z - margin_ft)
+
+
+def filter_internal_points(group):
+    """
+    Собирает точки из всех отверстий группы, 
+    но убирает точки, которые находятся внутри bbox ДРУГОГО отверстия.
+    Это фильтрует точки на внутренних перемычках между отверстиями.
+    """
+    margin_ft = mm_to_ft(20.0)  # небольшой отступ
+    
+    all_points = []
+    
+    for i, op in enumerate(group):
+        for pt in op.SamplePoints:
+            # Проверяем, не попадает ли точка внутрь другого отверстия в группе
+            inside_other = False
+            for j, other_op in enumerate(group):
+                if i == j:
+                    continue
+                if point_inside_opening_bbox(pt, other_op, margin_ft):
+                    inside_other = True
+                    break
+            
+            if not inside_other:
+                all_points.append(pt)
+    
+    return all_points
+
+
+def cluster_points(points, tol_ft):
+    """
+    Кластеризует точки по расстоянию.
+    Возвращает список кластеров, каждый кластер - список точек.
+    """
     if not points:
         return []
+
+    tol2 = tol_ft * tol_ft
+    clusters = []
+    used = [False] * len(points)
+
+    for i, p in enumerate(points):
+        if used[i]:
+            continue
+
+        # Начинаем новый кластер
+        cluster = [p]
+        used[i] = True
+
+        # Ищем все точки, близкие к текущему кластеру
+        changed = True
+        while changed:
+            changed = False
+            for j, q in enumerate(points):
+                if used[j]:
+                    continue
+                # Проверяем расстояние до любой точки в кластере
+                for cp in cluster:
+                    d2 = (q.X - cp.X) ** 2 + (q.Y - cp.Y) ** 2 + (q.Z - cp.Z) ** 2
+                    if d2 <= tol2:
+                        cluster.append(q)
+                        used[j] = True
+                        changed = True
+                        break
+
+        clusters.append(cluster)
+
+    return clusters
+
+
+def check_opening_has_diff(opening, grid_kr, grid_ar, debug=False, all_openings_in_group=None):
+    """
+    Проверяет точки внутри отверстия на расхождение КР vs АР.
+    Кластеризует точки расхождения и возвращает по одной точке на кластер.
+
+    Возвращает (has_diff, result_points, debug_info):
+    - has_diff: True если есть расхождение
+    - result_points: список точек на внешней грани (по одной на кластер)
+    - debug_info: информация для отладки
+    
+    all_openings_in_group: список всех оригинальных отверстий в группе (для фильтрации перемычек)
+    """
+    # Собираем все точки с их статусом
+    kr_yes_ar_no = []  # точки где КР=ДА, АР=НЕТ (бетон в КР, дырка в АР)
+    kr_no_ar_yes = []  # точки где КР=НЕТ, АР=ДА (дырка в КР, бетон в АР)
+    debug_info = []
+
+    for p in opening.SamplePoints:
+        in_kr = grid_kr.is_point_in_any_solid(p)
+        in_ar = grid_ar.is_point_in_any_solid(p)
+        
+        if in_kr and not in_ar:
+            kr_yes_ar_no.append(p)
+            if debug:
+                debug_info.append((p, True, False))
+        elif not in_kr and in_ar:
+            kr_no_ar_yes.append(p)
+            if debug:
+                debug_info.append((p, False, True))
+
+    # Фильтруем "граничные пары" — если рядом есть противоположное расхождение,
+    # это просто смещение геометрии КР/АР или очень тонкая перемычка,
+    # не реальное расхождение
+    # 350мм = 3 шага сетки (300мм) + запас на перемычки до 100мм
+    boundary_tol_ft = mm_to_ft(350.0)  # допуск для определения граничной пары
+    boundary_tol2 = boundary_tol_ft * boundary_tol_ft
+    
+    def is_near_opposite(p, opposite_list):
+        """Проверяет, есть ли рядом точка с противоположным расхождением"""
+        for op in opposite_list:
+            d2 = (p.X - op.X)**2 + (p.Y - op.Y)**2 + (p.Z - op.Z)**2
+            if d2 < boundary_tol2:
+                return True
+        return False
+    
+    # Оставляем только точки, у которых НЕТ противоположной пары рядом
+    filtered_kr_yes = [p for p in kr_yes_ar_no if not is_near_opposite(p, kr_no_ar_yes)]
+    filtered_kr_no = [p for p in kr_no_ar_yes if not is_near_opposite(p, kr_yes_ar_no)]
+    
+    diff_points = filtered_kr_yes + filtered_kr_no
+    
+    # Обновляем debug_info только для оставшихся точек
+    if debug:
+        filtered_set = set()
+        for p in diff_points:
+            filtered_set.add((round(p.X, 6), round(p.Y, 6), round(p.Z, 6)))
+        debug_info = [(p, kr, ar) for (p, kr, ar) in debug_info 
+                      if (round(p.X, 6), round(p.Y, 6), round(p.Z, 6)) in filtered_set]
+
+    # Проверяем минимальное количество точек расхождения
+    if not diff_points or len(diff_points) < MIN_DIFF_POINTS:
+        return False, [], None
+
+    # Кластеризуем точки расхождения
+    clusters = cluster_points(diff_points, CLUSTER_TOL_FT)
+
+    # BBox элемента (плиты/стены) для определения верхней грани
+    if opening.ElemBbMax and opening.ElemBbMin:
+        elem_bb_min = opening.ElemBbMin
+        elem_bb_max = opening.ElemBbMax
+    else:
+        elem_bb_min = opening.BbMin
+        elem_bb_max = opening.BbMax
+
+    offset_ft = mm_to_ft(5.0)  # небольшой отступ чтобы точка была чуть выше грани
+
+    result_points = []
+
+    for cluster in clusters:
+        # Центр кластера — точка внутри отверстия
+        # Используем её и для проверки, и для создания маркера
+        cx = sum(p.X for p in cluster) / len(cluster)
+        cy = sum(p.Y for p in cluster) / len(cluster)
+        cz = sum(p.Z for p in cluster) / len(cluster)
+        result_points.append(XYZ(cx, cy, cz))
+
+    # Формируем debug info
+    debug_result = None
+    if debug and debug_info:
+        debug_result = {
+            'opening_center': opening.Center,
+            'opening_dims_mm': [d * 304.8 for d in opening.DimsSorted],
+            'is_floor': opening.IsFloor,
+            'is_wall': opening.IsWall,
+            'source_role': opening.SourceRole,
+            'total_sample_points': len(opening.SamplePoints),
+            'diff_points_count': len(diff_points),
+            'clusters_count': len(clusters),
+            'diff_details': debug_info  # список (point, in_kr, in_ar)
+        }
+
+    return True, result_points, debug_result
+
+
+# ---------- FILTERS ----------
+
+def dedup_xyz_list(points, tol2_ft=DEDUP_TOL2_FT):
+    """
+    Дедупликация точек с использованием пространственного хэширования.
+    O(n) вместо O(n²).
+    """
+    if not points:
+        return []
+    
+    tol_ft = math.sqrt(tol2_ft)
+    cell_size = tol_ft  # размер ячейки = допуск
+    
     result = []
+    # Словарь: ключ ячейки -> список точек в этой ячейке
+    cells = {}
+    
+    # Соседние ячейки для проверки (включая диагонали)
+    offsets = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)]
+    
     for p in points:
+        # Индекс ячейки
+        ix = int(math.floor(p.X / cell_size))
+        iy = int(math.floor(p.Y / cell_size))
+        iz = int(math.floor(p.Z / cell_size))
+        
+        # Проверяем соседние ячейки на наличие дубликатов
         dup = False
-        for q in result:
-            if (p.X - q.X) ** 2 + (p.Y - q.Y) ** 2 + (p.Z - q.Z) ** 2 <= tol2_ft:
-                dup = True
+        for dx, dy, dz in offsets:
+            key = (ix + dx, iy + dy, iz + dz)
+            for q in cells.get(key, []):
+                if (p.X - q.X) ** 2 + (p.Y - q.Y) ** 2 + (p.Z - q.Z) ** 2 <= tol2_ft:
+                    dup = True
+                    break
+            if dup:
                 break
+        
         if not dup:
             result.append(p)
+            # Добавляем в ячейку
+            key = (ix, iy, iz)
+            if key not in cells:
+                cells[key] = []
+            cells[key].append(p)
+    
     return result
 
 
 def filter_isolated_points(points, radius_ft):
+    """Удаляет одиночные точки, у которых нет соседей в радиусе."""
     if not points or len(points) < 2:
         return []
     if radius_ft <= 0:
@@ -637,297 +1308,7 @@ def filter_isolated_points(points, radius_ft):
     return [points[i] for i in range(n) if keep[i]]
 
 
-# ---------- OPENINGS ----------
-
-class Opening(object):
-    def __init__(self, center, dims_sorted, element, face_id, bb_min, bb_max, edge_point=None):
-        self.Center = center              # геометрический центр отверстия
-        self.DimsSorted = dims_sorted
-        self.ElementId = element.Id
-        self.FaceId = face_id             # можно оставить на будущее, но дальше не используем
-        self.BbMin = bb_min
-        self.BbMax = bb_max
-        # точка на грани отверстия (midpoint внутреннего ребра в координатах host)
-        self.EdgePoint = edge_point or center
-
-
-def get_opening_edge_point(opening, cache_dict=None):
-    """
-    Возвращает точку на грани отверстия в координатах host.
-    Если при сборе отверстия midpoint не удалось вычислить,
-    вернёт центр отверстия.
-    """
-    try:
-        ep = getattr(opening, "EdgePoint", None)
-        if ep:
-            return ep
-    except:
-        pass
-    return opening.Center
-
-
-
-def is_thermo_size(side_big, side_mid, size_pairs, tol):
-    for b, m in size_pairs:
-        if (abs(side_big - b) <= tol and abs(side_mid - m) <= tol) or \
-           (abs(side_big - m) <= tol and abs(side_mid - b) <= tol):
-            return True
-    return False
-
-
-def collect_openings_from_elements(elems, tr_to_host=None, cache_dict=None,
-                                   min_side_big_ft=0, min_side_mid_ft=0):
-    openings = []
-    face_counter = 0
-    for el in elems:
-        solids = get_cached_solids(el, cache_dict) if cache_dict else get_all_solids(el)
-        if not solids:
-            continue
-        is_wall = (el.Category.Id.IntegerValue == int(BuiltInCategory.OST_Walls)) if el.Category else False
-        is_floor = (el.Category.Id.IntegerValue == int(BuiltInCategory.OST_Floors)) if el.Category else False
-
-        bb = el.get_BoundingBox(None)
-        z_min, z_max = (bb.Min.Z, bb.Max.Z) if bb else (None, None)
-
-        for solid in solids:
-            if not solid.Faces:
-                continue
-            for face in solid.Faces:
-                loops = face.EdgeLoops
-                if not loops or loops.Size < 2:
-                    continue
-
-                for li in range(1, loops.Size):
-                    loop = loops[li]
-                    verts = []
-                    edge_mid_host = None  # тут будем хранить midpoint первого ребра
-
-                    for edge in loop:
-                        try:
-                            c = edge.AsCurve()
-                        except:
-                            continue
-                        if not c:
-                            continue
-
-                        # локальные точки (в системе элемента / линка)
-                        p0_local = c.GetEndPoint(0)
-                        p1_local = c.GetEndPoint(1)
-
-                        # трансформация в host
-                        if tr_to_host:
-                            p0 = tr_to_host.OfPoint(p0_local)
-                            p1 = tr_to_host.OfPoint(p1_local)
-                        else:
-                            p0 = p0_local
-                            p1 = p1_local
-
-                        verts.append(p0)
-                        verts.append(p1)
-
-                        # сохраняем midpoint первого ребра, уже в координатах host
-                        if edge_mid_host is None:
-                            try:
-                                mid_local = c.Evaluate(0.5, True)
-                                edge_mid_host = tr_to_host.OfPoint(mid_local) if tr_to_host else mid_local
-                            except:
-                                pass
-
-                    if len(verts) < 6:
-                        continue
-
-                    xs = [p.X for p in verts]
-                    ys = [p.Y for p in verts]
-                    zs = [p.Z for p in verts]
-
-                    center = XYZ(sum(xs) / len(verts),
-                                 sum(ys) / len(verts),
-                                 sum(zs) / len(verts))
-
-                    if is_wall and z_min is not None:
-                        if abs(center.Z - z_min) <= BBOX_FACE_TOL_FT or \
-                           abs(center.Z - z_max) <= BBOX_FACE_TOL_FT:
-                            continue
-
-                    dx = max(xs) - min(xs)
-                    dy = max(ys) - min(ys)
-                    dz = max(zs) - min(zs)
-                    dims = sorted([dx, dy, dz])
-                    mid = dims[1]
-                    big = dims[2]
-
-                    # отверстия, не проёмы
-                    if big >= PROEM_SIDE_FT:
-                        continue
-
-                    if is_floor and is_thermo_size(big, mid, THERMO_FLOOR_SIZES_FT, THERMO_TOL_FT):
-                        continue
-                    if is_wall and is_thermo_size(big, mid, THERMO_WALL_SIZES_FT, THERMO_TOL_FT):
-                        continue
-
-                    if min_side_big_ft > 0 or min_side_mid_ft > 0:
-                        if big <= min_side_big_ft and mid <= min_side_mid_ft:
-                            continue
-
-                    face_counter += 1
-                    bb_min = XYZ(min(xs), min(ys), min(zs))
-                    bb_max = XYZ(max(xs), max(ys), max(zs))
-
-                    # если midpoint не удалось вычислить - используем центр
-                    edge_pt = edge_mid_host or center
-
-                    openings.append(
-                        Opening(center, dims, el, face_counter, bb_min, bb_max, edge_pt)
-                    )
-    return openings
-
-
-
-def match_openings(host_openings, link_openings, pos_tol, size_tol):
-    unmatched_host = []
-    used_link = set()
-    for h in host_openings:
-        match = None
-        for idx, l in enumerate(link_openings):
-            if idx in used_link:
-                continue
-            dist = h.Center.DistanceTo(l.Center)
-            if dist > pos_tol:
-                continue
-            if abs(h.DimsSorted[1] - l.DimsSorted[1]) > size_tol or \
-               abs(h.DimsSorted[2] - l.DimsSorted[2]) > size_tol:
-                continue
-            match = idx
-            break
-        if match is None:
-            unmatched_host.append(h)
-        else:
-            used_link.add(match)
-    unmatched_link = [l for i, l in enumerate(link_openings) if i not in used_link]
-    return unmatched_host, unmatched_link
-
-
-def generate_opening_sample_points(opening,
-                                   offset_mm=OPENING_OFFSET_MM,
-                                   max_step_mm=OPENING_STEP_MM):
-    offset_ft = mm_to_ft(offset_mm)
-    step_ft = mm_to_ft(max_step_mm)
-
-    bb_min = opening.BbMin
-    bb_max = opening.BbMax
-
-    min_x = bb_min.X + offset_ft
-    max_x = bb_max.X - offset_ft
-    min_y = bb_min.Y + offset_ft
-    max_y = bb_max.Y - offset_ft
-    min_z = bb_min.Z + offset_ft
-    max_z = bb_max.Z - offset_ft
-
-    if min_x >= max_x or min_y >= max_y or min_z >= max_z:
-        return [opening.Center]
-
-    dx = max_x - min_x
-    dy = max_y - min_y
-    dz = max_z - min_z
-
-    dims = [(dx, 0), (dy, 1), (dz, 2)]
-    dims_sorted = sorted(dims, key=lambda x: x[0])
-    big_len, big_axis = dims_sorted[2]
-
-    cx = 0.5 * (min_x + max_x)
-    cy = 0.5 * (min_y + max_y)
-    cz = 0.5 * (min_z + max_z)
-
-    n = max(1, int(round(big_len / step_ft)))
-    pts = []
-    for i in range(n + 1):
-        t = float(i) / max(1, n)
-        if big_axis == 0:
-            x = min_x + big_len * t
-            y = cy
-            z = cz
-        elif big_axis == 1:
-            x = cx
-            y = min_y + big_len * t
-            z = cz
-        else:
-            x = cx
-            y = cy
-            z = min_z + big_len * t
-        pts.append(XYZ(x, y, z))
-    return pts
-
-
-def opening_causes_real_diff(opening, grid_kr, grid_ar):
-    pts = generate_opening_sample_points(opening)
-    for p in pts:
-        in_kr = grid_kr.is_point_in_any_solid(p)
-        in_ar = grid_ar.is_point_in_any_solid(p)
-        if in_kr != in_ar:
-            return True
-    return False
-
-
-# ---------- PROEM PERIMETER ----------
-
-def add_points_on_loop_edges(loop, tr_to_host, pts_list, step_ft):
-    if pts_list is None or step_ft <= 0:
-        return
-    for edge in loop:
-        try:
-            crv = edge.AsCurve()
-        except:
-            continue
-        if not crv or crv.Length <= 0:
-            continue
-        n = max(1, int(round(crv.Length / step_ft)))
-        for i in range(n + 1):
-            try:
-                p = crv.Evaluate(float(i) / n, True)
-            except:
-                continue
-            if tr_to_host:
-                p = tr_to_host.OfPoint(p)
-            pts_list.append(p)
-
-
-def collect_proem_perimeter_points(elems, tr_to_host, cache_dict, pts_list):
-    step_ft = mm_to_ft(PROEM_STEP_MM)
-    for el in elems:
-        solids = get_cached_solids(el, cache_dict) if cache_dict else get_all_solids(el)
-        for solid in solids:
-            if not solid.Faces:
-                continue
-            for face in solid.Faces:
-                loops = face.EdgeLoops
-                if not loops or loops.Size < 2:
-                    continue
-                for li in range(1, loops.Size):
-                    loop = loops[li]
-                    verts = []
-                    for edge in loop:
-                        try:
-                            c = edge.AsCurve()
-                        except:
-                            continue
-                        if c:
-                            verts.extend([c.GetEndPoint(0), c.GetEndPoint(1)])
-                    if not verts:
-                        continue
-                    xs = [p.X for p in verts]
-                    ys = [p.Y for p in verts]
-                    zs = [p.Z for p in verts]
-                    dims = sorted([
-                        max(xs) - min(xs),
-                        max(ys) - min(ys),
-                        max(zs) - min(zs)
-                    ])
-                    big = dims[2]
-                    if big >= PROEM_SIDE_FT:
-                        add_points_on_loop_edges(loop, tr_to_host, pts_list, step_ft)
-
-
-# ---------- LINK CONTEXT & DEDUP ----------
+# ---------- LINK CONTEXT ----------
 
 class LinkContext(object):
     def __init__(self, inst):
@@ -940,9 +1321,6 @@ class LinkContext(object):
         self.StructElems = []
         self.SolidsCache = {}
         self.Solids = []
-        self.VerticesHost = []
-        self.RandomHost = []
-        self.SolidElemsCount = 0
 
 
 def classify_link_role(link_inst):
@@ -953,6 +1331,8 @@ def classify_link_role(link_inst):
         return "KR"
     return "AR"
 
+
+# ---------- FAILURE PREPROCESSOR ----------
 
 class SuppressDuplicatePoints(IFailuresPreprocessor):
     def PreprocessFailures(self, failuresAccessor):
@@ -994,8 +1374,7 @@ def dedup_existing_points(pts, locs, stats, lasts, tol2=DEDUP_TOL2_FT):
 # ---------- MAIN ----------
 
 def main():
-
-    # семейство "Точка"
+    # Семейство "Точка"
     sym = next(
         (
             s for s in FilteredElementCollector(doc).OfClass(FamilySymbol)
@@ -1006,7 +1385,8 @@ def main():
     if not sym:
         TaskDialog.Show(__title__, u"Нет семейства 'Точка'.")
         return
-    # 0. Выбор host
+
+    # 0. Выбор host-элементов
     try:
         refs_host = uidoc.Selection.PickObjects(ObjectType.Element, "Выберите элементы Host (КР)")
     except:
@@ -1017,7 +1397,7 @@ def main():
     host_elems_struct_cat = [e for e in host_elems_raw if is_structural_element(e)]
     host_struct = [e for e in host_elems_struct_cat if element_has_target_material(e, doc)]
 
-    # 0.2 Выбор link
+    # 0.2 Выбор link-элементов
     try:
         refs_link = uidoc.Selection.PickObjects(ObjectType.LinkedElement, "Выберите элементы Link (КР+АР)")
     except:
@@ -1026,7 +1406,6 @@ def main():
         return
 
     link_ctx_dict = {}
-    link_elems_raw = []
 
     for r in refs_link:
         li = doc.GetElement(r.ElementId)
@@ -1043,7 +1422,6 @@ def main():
         el_link = link_doc.GetElement(r.LinkedElementId)
         if el_link:
             ctx.RawElems.append(el_link)
-            link_elems_raw.append(el_link)
 
     kr_ctxs = []
     ar_ctxs = []
@@ -1065,124 +1443,44 @@ def main():
         TaskDialog.Show(__title__, u"Нет бетона в выборе.")
         return
 
-    # 1. Параметры отверстий
-    min_big_mm, min_mid_mm = parse_min_opening_size_mm(200.0)
-    use_openings = not (min_big_mm <= 0 and min_mid_mm <= 0)
+    # Проверка наличия элементов АР
+    ar_struct_count = sum(len(ctx.StructElems) for ctx in ar_ctxs)
+    if ar_struct_count == 0:
+        TaskDialog.Show(__title__, u"Не выбрано ни одного элемента АР.\n\nПодгрузите связи АР и выберите элементы из них.")
+        return
 
-    # +5 мм к пользовательскому порогу
+    # 1. Параметры отверстий (диапазон размеров)
+    min_size_mm, max_size_mm = parse_opening_size_range_mm(200.0, 2000.0)
+
     extra_mm = 5.0
-    min_big_ft = mm_to_ft(min_big_mm + extra_mm)
-    min_mid_ft = mm_to_ft(min_mid_mm + extra_mm)
+    min_size_ft = mm_to_ft(min_size_mm + extra_mm)
+    max_size_ft = mm_to_ft(max_size_mm)
 
-    # таймер
+    # Таймер
     start_time = System.DateTime.Now
     run_id = System.Guid.NewGuid().ToString()
     today_str = format_datetime_short(start_time)
 
-    # Счётчики для отчета
-    host_struct_solid_elems = 0
-    link_struct_solid_elems = 0
-    total_host_vertices_struct = 0
-    total_host_random_struct = 0
-    total_link_vertices_struct = 0
-    total_link_random_struct = 0
-
-    # 2. Солиды и точки
+    # 2. Собираем солиды для Voxel Grid (нужны для проверки точек)
     host_solids_all = []
     host_solids_cache = {}
-    pts_raw_kr = []
-    pts_raw_ar = []
 
-    # Host (КР)
     for el in host_struct:
-        solid = get_first_valid_solid(el, host_solids_cache)
-        if not solid:
-            continue
-        host_struct_solid_elems += 1
-        v = get_solid_vertices(solid)
-        total_host_vertices_struct += len(v)
-        bb = grow_bbox(make_bbox_from_points(v), BOUNDARY_TOL_FT)
-        host_solids_all.append((solid, bb))
-        vol_m3 = get_volume_m3_from_solid(solid)
-        n_rand = get_random_count_for_volume_m3(vol_m3)
-        r = sample_points_in_solid(el, solid, n_rand)
-        total_host_random_struct += len(r)
-        pts_raw_kr.extend(v)
-        pts_raw_kr.extend(r)
+        solids = get_cached_solids(el, host_solids_cache)
+        for solid in solids:
+            v = get_solid_vertices(solid)
+            bb = grow_bbox(make_bbox_from_points(v), BOUNDARY_TOL_FT)
+            host_solids_all.append((solid, bb))
 
-    # Links (КР + АР)
     for ctx in link_ctx_dict.values():
         for el in ctx.StructElems:
-            solid = get_first_valid_solid(el, ctx.SolidsCache)
-            if not solid:
-                continue
-            ctx.SolidElemsCount += 1
-            link_struct_solid_elems += 1
-            v = get_solid_vertices(solid)
-            total_link_vertices_struct += len(v)
-            bb_local = grow_bbox(make_bbox_from_points(v), BOUNDARY_TOL_FT)
-            ctx.Solids.append((solid, bb_local))
+            solids = get_cached_solids(el, ctx.SolidsCache)
+            for solid in solids:
+                v = get_solid_vertices(solid)
+                bb_local = grow_bbox(make_bbox_from_points(v), BOUNDARY_TOL_FT)
+                ctx.Solids.append((solid, bb_local))
 
-            vol_m3_link = get_volume_m3_from_solid(solid)
-            n_rand_link = get_random_count_for_volume_m3(vol_m3_link)
-            v_host = [ctx.Tr.OfPoint(p) for p in v]
-            r_host = sample_points_in_link_solid_host(
-                solid,
-                ctx.Tr,
-                n_rand_link,
-                bb_local
-            )
-            total_link_random_struct += len(r_host)
-
-            ctx.VerticesHost.extend(v_host)
-            ctx.RandomHost.extend(r_host)
-
-            target = pts_raw_kr if ctx.Role == "KR" else pts_raw_ar
-            target.extend(v_host)
-            target.extend(r_host)
-
-    # Дополнительные точки по контуру больших проёмов
-    extra_proem_kr = []
-    extra_proem_ar = []
-    collect_proem_perimeter_points(host_struct, None, host_solids_cache, extra_proem_kr)
-    for ctx in link_ctx_dict.values():
-        target = extra_proem_kr if ctx.Role == "KR" else extra_proem_ar
-        collect_proem_perimeter_points(ctx.StructElems, ctx.Tr, ctx.SolidsCache, target)
-
-    pts_raw_kr.extend(extra_proem_kr)
-    pts_raw_ar.extend(extra_proem_ar)
-
-    # 3. Отверстия (мелкие, < 1000 мм) - только собираем, без финальной проверки
-    unmatched_kr_ops = []
-    unmatched_ar_ops = []
-    ops_kr = []
-    ops_ar = []
-
-    if use_openings:
-        ops_kr = collect_openings_from_elements(
-            host_struct, None, host_solids_cache,
-            min_big_ft, min_mid_ft
-        )
-        for ctx in kr_ctxs:
-            ops_kr.extend(
-                collect_openings_from_elements(
-                    ctx.StructElems, ctx.Tr, ctx.SolidsCache,
-                    min_big_ft, min_mid_ft
-                )
-            )
-        for ctx in ar_ctxs:
-            ops_ar.extend(
-                collect_openings_from_elements(
-                    ctx.StructElems, ctx.Tr, ctx.SolidsCache,
-                    min_big_ft, min_mid_ft
-                )
-            )
-        if ops_kr or ops_ar:
-            unmatched_kr_ops, unmatched_ar_ops = match_openings(
-                ops_kr, ops_ar, POS_TOL_FT, SIZE_TOL_FT
-            )
-
-    # 4. VOXEL GRID: построение
+    # 3. Строим Voxel Grid для КР и АР
     grid_kr = VoxelGrid(cell_size_mm=VOXEL_CELL_MM)
     grid_kr.add_host_solids(host_solids_all)
     grid_kr.add_link_contexts(kr_ctxs)
@@ -1190,43 +1488,183 @@ def main():
     grid_ar = VoxelGrid(cell_size_mm=VOXEL_CELL_MM)
     grid_ar.add_link_contexts(ar_ctxs)
 
-    # 5. Фильтрация точек через воксели
-    pts_filtered_kr = [p for p in pts_raw_kr if not grid_ar.is_point_in_any_solid(p)]
-    pts_filtered_ar = [p for p in pts_raw_ar if not grid_kr.is_point_in_any_solid(p)]
+    # 4. Собираем отверстия из КР и АР
+    ops_kr = collect_openings_from_elements(
+        host_struct, None, host_solids_cache, "KR_host",
+        min_size_ft, min_size_ft, max_size_ft, debug=False
+    )
+    for ctx in kr_ctxs:
+        ops_kr.extend(
+            collect_openings_from_elements(
+                ctx.StructElems, ctx.Tr, ctx.SolidsCache, "KR_link",
+                min_size_ft, min_size_ft, max_size_ft, debug=False
+            )
+        )
 
-    # 6. Финальная проверка отверстий по бетону через несколько точек внутри
-    opening_pts = []
-    if use_openings and (unmatched_kr_ops or unmatched_ar_ops):
-        for o in unmatched_kr_ops:
-            if opening_causes_real_diff(o, grid_kr, grid_ar):
-                p = get_opening_edge_point(o, host_solids_cache)
-                opening_pts.append(p)
+    ops_ar = []
+    for ctx in ar_ctxs:
+        ops_ar.extend(
+            collect_openings_from_elements(
+                ctx.StructElems, ctx.Tr, ctx.SolidsCache, "AR_link",
+                min_size_ft, min_size_ft, max_size_ft, debug=False
+            )
+        )
 
-        for o in unmatched_ar_ops:
-            if opening_causes_real_diff(o, grid_kr, grid_ar):
-                p = get_opening_edge_point(o, host_solids_cache)
-                opening_pts.append(p)
+    total_ops_kr = len(ops_kr)
+    total_ops_ar = len(ops_ar)
 
-    all_pts = pts_filtered_kr + pts_filtered_ar + opening_pts
+    # 5. Сначала объединяем ВПРИТЫК отверстия внутри КР и внутри АР отдельно
+    #    (отверстия которые касаются друг друга, gap=0)
+    #    Это нужно когда одно большое отверстие смоделировано как несколько маленьких впритык
+    touching_gap_ft = mm_to_ft(5.0)  # 5мм допуск на "впритык"
+    
+    # Объединяем впритык в КР
+    kr_groups = merge_openings_into_groups(ops_kr, touching_gap_ft)
+    ops_kr_merged = []
+    for group in kr_groups:
+        merged = create_merged_opening_from_group(group)
+        if merged:
+            ops_kr_merged.append(merged)
+    
+    # Объединяем впритык в АР
+    ar_groups = merge_openings_into_groups(ops_ar, touching_gap_ft)
+    ops_ar_merged = []
+    for group in ar_groups:
+        merged = create_merged_opening_from_group(group)
+        if merged:
+            ops_ar_merged.append(merged)
 
-    if not all_pts:
-        TaskDialog.Show(__title__, u"После сравнения КР vs АР и отверстий не осталось новых точек.\n"
-                                   u"Статусы существующих точек в зоне проверки будут обновлены.")
+    # 6. Теперь объединяем КР и АР вместе (с допуском на перемычки)
+    #    Это нужно чтобы не считать перемычки между соседними отверстиями как расхождения
+    all_openings_raw = ops_kr_merged + ops_ar_merged
+    
+    # Группируем отверстия по близости
+    opening_groups = merge_openings_into_groups(all_openings_raw, OPENING_MERGE_GAP_FT)
+    
+    # Создаём объединённые отверстия из групп
+    all_openings = []
+    merged_groups_count = 0
+    for group in opening_groups:
+        merged = create_merged_opening_from_group(group)
+        if merged:
+            all_openings.append(merged)
+            if len(group) > 1:
+                merged_groups_count += 1
 
-    # фильтр одиночек и дубликатов
-    all_pts_iso = filter_isolated_points(all_pts, RADIUS_ISO_FT)
-    final_pts = dedup_xyz_list(all_pts_iso)
+    # DEBUG MODE - установить True для отладки
+    DEBUG_MODE = False
+    # DEBUG: создавать точки прямо в местах расхождений (для визуализации)
+    DEBUG_CREATE_DIFF_POINTS = False
+    
+    openings_with_diff = []
+    diff_points = []  # точки для создания маркеров (центры кластеров внутри отверстий)
+    debug_reports = []  # для дебага
+    debug_raw_diff_points = []  # сырые точки расхождений для визуализации
 
+    for op in all_openings:
+        has_diff, result_points, debug_info = check_opening_has_diff(op, grid_kr, grid_ar, debug=DEBUG_MODE)
+        if has_diff and result_points:
+            openings_with_diff.append(op)
+            diff_points.extend(result_points)  # добавляем точки (центры кластеров внутри отверстий)
+            if debug_info:
+                debug_reports.append(debug_info)
+                # Собираем сырые точки расхождений
+                if DEBUG_CREATE_DIFF_POINTS:
+                    for pt, in_kr, in_ar in debug_info['diff_details']:
+                        debug_raw_diff_points.append(pt)
 
+    # Выводим дебаг информацию
+    if DEBUG_MODE and debug_reports:
+        print(u"")
+        print(u"=" * 60)
+        print(u"DEBUG: Отверстия с расхождениями")
+        print(u"=" * 60)
+        for idx, dbg in enumerate(debug_reports):
+            center = dbg['opening_center']
+            dims = dbg['opening_dims_mm']
+            print(u"")
+            print(u"[{}] Отверстие:".format(idx + 1))
+            print(u"    Центр: X={:.0f}, Y={:.0f}, Z={:.0f} мм".format(
+                center.X * 304.8, center.Y * 304.8, center.Z * 304.8))
+            print(u"    Размеры: {:.0f} x {:.0f} x {:.0f} мм".format(dims[0], dims[1], dims[2]))
+            print(u"    Тип: {}".format(
+                u"Плита" if dbg['is_floor'] else (u"Стена" if dbg['is_wall'] else u"Другое")))
+            print(u"    Источник: {}".format(dbg['source_role']))
+            print(u"    Точек проверки: {}".format(dbg['total_sample_points']))
+            print(u"    Точек с расхождением: {}".format(dbg['diff_points_count']))
+            print(u"    Кластеров: {}".format(dbg['clusters_count']))
+            print(u"    Детали расхождений (первые 5):")
+            for i, (pt, in_kr, in_ar) in enumerate(dbg['diff_details'][:5]):
+                print(u"      pt{}: X={:.0f}, Y={:.0f}, Z={:.0f} | КР={} АР={}".format(
+                    i + 1,
+                    pt.X * 304.8, pt.Y * 304.8, pt.Z * 304.8,
+                    u"ДА" if in_kr else u"НЕТ",
+                    u"ДА" if in_ar else u"НЕТ"))
+            if len(dbg['diff_details']) > 5:
+                print(u"      ... и ещё {} точек".format(len(dbg['diff_details']) - 5))
+        print(u"=" * 60)
+        print(u"")
+
+    # DEBUG: заменяем финальные точки на сырые точки расхождений
+    if DEBUG_CREATE_DIFF_POINTS and debug_raw_diff_points:
+        print(u"DEBUG: Создаём точки в местах расхождений: {} шт".format(len(debug_raw_diff_points)))
+        final_pts = debug_raw_diff_points
+        pts_before_verify = len(final_pts)
+        pts_filtered_by_verify = 0
+        # В дебаг режиме НЕ дедуплицируем и НЕ верифицируем — показываем все точки
+    else:
+        # 6. Дедупликация с большим допуском (отверстия из КР и АР близко/совпадают)
+        deduped_pts = dedup_xyz_list(diff_points, FINAL_DEDUP_TOL2_FT)
+
+        # 7. ФИНАЛЬНАЯ ПРОВЕРКА: перепроверяем каждую точку по солидам КР и АР
+        #    Точка внутри отверстия — проверяем и создаём там же
+        pts_before_verify = len(deduped_pts)
+        verified_pts = []
+        
+        if DEBUG_MODE:
+            print(u"")
+            print(u"=" * 60)
+            print(u"DEBUG: Финальная проверка точек")
+            print(u"=" * 60)
+        
+        for p in deduped_pts:
+            in_kr = grid_kr.is_point_in_any_solid(p)
+            in_ar = grid_ar.is_point_in_any_solid(p)
+            has_diff = (in_kr and not in_ar) or (in_ar and not in_kr)
+            
+            if DEBUG_MODE:
+                print(u"  X={:.0f}, Y={:.0f}, Z={:.0f} | КР={} АР={} | diff={}".format(
+                    p.X * 304.8, p.Y * 304.8, p.Z * 304.8,
+                    u"ДА" if in_kr else u"НЕТ",
+                    u"ДА" if in_ar else u"НЕТ",
+                    u"ДА" if has_diff else u"НЕТ"))
+            
+            if has_diff:
+                verified_pts.append(p)
+        
+        if DEBUG_MODE:
+            print(u"")
+            print(u"Прошло проверку: {} из {}".format(len(verified_pts), pts_before_verify))
+            print(u"=" * 60)
+        
+        pts_filtered_by_verify = pts_before_verify - len(verified_pts)
+        final_pts = verified_pts
+
+    if not final_pts:
+        TaskDialog.Show(__title__, u"После проверки отверстий расхождений не найдено.\n"
+                                   u"КР отверстий: {}\nАР отверстий: {}\n"
+                                   u"Объединено в групп: {}".format(total_ops_kr, total_ops_ar, merged_groups_count))
+
+    # Активируем семейство
     if not sym.IsActive:
         t_act = Transaction(doc, "Activate Symbol")
         t_act.Start()
         sym.Activate()
         t_act.Commit()
 
-    # 6. Существующие точки в зоне проверки
-    pts_zone = pts_raw_kr + pts_raw_ar
-    bbox_check_raw = make_bbox_from_points(pts_zone) if pts_zone else None
+    # 8. Зона проверки для существующих точек
+    all_opening_centers = [op.Center for op in ops_kr] + [op.Center for op in ops_ar]
+    bbox_check_raw = make_bbox_from_points(all_opening_centers) if all_opening_centers else None
     bbox_check = grow_bbox(bbox_check_raw, RADIUS_ISO_FT) if bbox_check_raw else None
 
     exist_pts = []
@@ -1262,7 +1700,7 @@ def main():
         exist_pts, exist_locs, exist_stats, exist_lasts
     )
 
-    # 7. Матчинг новых координат с существующими точками
+    # 9. Матчинг новых точек с существующими
     matched_indices = set()
     new_to_create = []
     for p_new in final_pts:
@@ -1278,7 +1716,7 @@ def main():
         else:
             new_to_create.append(p_new)
 
-    # 8. Транзакция
+    # 10. Транзакция
     t = Transaction(doc, __title__)
     t.Start()
     opts = t.GetFailureHandlingOptions()
@@ -1290,14 +1728,14 @@ def main():
     cnt_err = 0
 
     try:
-        # удаляем геометрические дубли старых точек
+        # Удаляем геометрические дубли старых точек
         for eid in ids_del:
             try:
                 doc.Delete(eid)
             except:
                 pass
 
-        # обновляем существующие точки
+        # Обновляем существующие точки
         for i, fi in enumerate(exist_pts):
             p_last = fi.LookupParameter(PARAM_POINT_LAST)
             p_run = fi.LookupParameter(PARAM_POINT_RUNID)
@@ -1328,7 +1766,7 @@ def main():
                 p_st.Set(new_status)
             set_point_material_by_status(fi, new_status)
 
-        # создаем новые точки
+        # Создаем новые точки
         for p in new_to_create:
             try:
                 fi = doc.Create.NewFamilyInstance(p, sym, StructuralType.NonStructural)
@@ -1362,75 +1800,40 @@ def main():
     elapsed = end_time - start_time
     elapsed_sec = elapsed.TotalSeconds
 
-    kr_links_count = len(kr_ctxs)
-    ar_links_count = len(ar_ctxs)
-
+    # Отчёт
     msg_lines = [
-        u"Время выполнения скрипта: {:.2f} сек".format(elapsed_sec),
+        u"Время выполнения: {:.2f} сек".format(elapsed_sec),
         u"",
-        u"Роли связей:",
-        u" КР-связей: {}".format(kr_links_count),
-        u" АР-связей: {}".format(ar_links_count),
+        u"=== ПРОВЕРКА ТОЛЬКО ОТВЕРСТИЙ ===",
         u"",
-        u"Допуск по границе для бетона (точки на гранях считаются внутри): {:.1f} мм".format(BOUNDARY_TOL_MM),
-        u"Радиус для удаления одиночных точек: {:.1f} мм".format(RADIUS_ISO_MM),
-        u"Радиус совпадения с существующими точками: {:.1f} мм".format(POINT_MATCH_RADIUS_MM),
+        u"Связей КР: {}".format(len(kr_ctxs)),
+        u"Связей АР: {}".format(len(ar_ctxs)),
         u"",
-        u"Минимальный размер отверстий (учитываем только >=, для внутр. проверки): {:.1f} x {:.1f} мм".format(
-            min_big_mm, min_mid_mm
-        ),
-        u"Фильтры термовкладышей по плитам (игнорируем отверстия, две большие стороны ±{:.1f} мм): {}".format(
-            THERMO_TOL_MM,
-            u", ".join([u"{}x{} мм".format(int(a), int(b)) for (a, b) in THERMO_FLOOR_SIZES_MM])
-        ),
-        u"Фильтры термовкладышей по стенам (±{:.1f} мм): {}".format(
-            THERMO_TOL_MM,
-            u", ".join([u"{}x{} мм".format(int(a), int(b)) for (a, b) in THERMO_WALL_SIZES_MM])
-        ),
-        u"Порог для ПРОЁМОВ (точки по контуру): >= {:.1f} мм любой большой стороны".format(PROEM_SIDE_MM),
-        u"Шаг точек по контуру проёма: ~{:.1f} мм".format(PROEM_STEP_MM),
-        u"Размер ячейки Voxel Grid: {:.1f} мм".format(VOXEL_CELL_MM),
+        u"Host-элементов (КР, бетон): {}".format(len(host_struct)),
+        u"Link-элементов (КР+АР, бетон): {}".format(len(all_link_struct)),
         u"",
-        u"Host-элементы (выбраны пользователем): {}".format(len(host_elems_raw)),
-        u" Host-элементы после фильтра по категориям (несущие): {}".format(len(host_elems_struct_cat)),
-        u" Host-КР (бетон/монолит по материалу): {}".format(len(host_struct)),
-        u" Элементов host-КР с валидным solid: {}".format(host_struct_solid_elems),
-        u" Вершин по host-КР-элементам: {}".format(total_host_vertices_struct),
-        u" Внутренних точек по host-КР (по объёмным правилам): ~{}".format(total_host_random_struct),
+        u"Диапазон размеров отверстий: {:.0f} - {:.0f} мм".format(min_size_mm, max_size_mm),
+        u"Шаг сетки проверки: {:.0f} мм".format(OPENING_STEP_MM),
+        u"Порог объединения кустов: {:.0f} мм".format(OPENING_MERGE_GAP_MM),
         u"",
-        u"Link-элементы (все выбранные, до фильтров): {}".format(len(link_elems_raw)),
-        u" Link-бетон/монолит (КР+АР по материалу): {}".format(len(all_link_struct)),
-        u" Элементов link с валидным solid (КР+АР): {}".format(link_struct_solid_elems),
-        u" Вершин по link-элементам (Triangulate, только для отчёта): {}".format(total_link_vertices_struct),
-        u" Внутренних точек по link (по объёмным правилам): ~{}".format(total_link_random_struct),
+        u"Отверстий найдено в КР: {}".format(total_ops_kr),
+        u"Отверстий найдено в АР: {}".format(total_ops_ar),
+        u"Объединено в групп (кустов): {}".format(merged_groups_count),
+        u"Всего отверстий/групп для проверки: {}".format(len(all_openings)),
         u"",
-        u"Solids КР-стороны (host + КР-линки):",
-        u" beton/monolit-solids в host: {}".format(len(host_solids_all)),
-        u" beton/monolit-solids в КР-линках: {}".format(sum(len(ctx.Solids) for ctx in kr_ctxs)),
-        u"Solids АР-стороны (АР-линки): {}".format(sum(len(ctx.Solids) for ctx in ar_ctxs)),
+        u"Мин. точек расхождения для маркера: {}".format(MIN_DIFF_POINTS),
+        u"Отверстий с расхождением по бетону: {}".format(len(openings_with_diff)),
+        u"Порог кластеризации: {:.0f} мм".format(CLUSTER_TOL_MM),
         u"",
-        u"Фильтрация пересечений (бетон, КР vs АР) через Voxel Grid:",
-        u" Осталось КР-точек по бетону: {}".format(len(pts_filtered_kr)),
-        u" Осталось АР-точек по бетону: {}".format(len(pts_filtered_ar)),
+        u"Точек до финальной проверки: {}".format(pts_before_verify),
+        u"Отсеяно финальной проверкой: {}".format(pts_filtered_by_verify),
+        u"Точек для создания: {}".format(len(final_pts)),
         u"",
-        u"Отверстия по внутренним лупам (после фильтра по размеру, если не 0):",
-        u" КР-отверстий (host + КР-линки): {}".format(len(ops_kr) if use_openings else 0),
-        u" АР-отверстий (АР-линки): {}".format(len(ops_ar) if use_openings else 0),
-        u" Несовпадающих отверстий (КР, после матчинга): {}".format(len(unmatched_kr_ops)),
-        u" Несовпадающих отверстий (АР, после матчинга): {}".format(len(unmatched_ar_ops)),
-        u" Несовпадающих отверстий, подтвердившихся по бетону (через несколько точек): {}".format(
-            len(opening_pts)
-        ),
-        u"",
-        u"Точек всего до удаления одиночек: {}".format(len(all_pts)),
-        u"Точек после удаления одиночек: {}".format(len(all_pts_iso)),
-        u"Точек после удаления геодублей: {}".format(len(final_pts)),
-        u"Новых точек, созданных в этом запуске: {}".format(cnt_create),
-        u"Старых точек в зоне проверки (после деда): {}".format(len(exist_pts)),
-        u"Старых точек, совпавших с новыми проблемами (включая 'Допуск'): {}".format(len(matched_indices)),
-        u"",
-        u"Удалено дублирующихся старых точек: {}".format(len(ids_del)),
-        u"Ошибок при создании точек: {}".format(cnt_err),
+        u"Новых точек создано: {}".format(cnt_create),
+        u"Существующих точек в зоне: {}".format(len(exist_pts)),
+        u"Совпавших с существующими: {}".format(len(matched_indices)),
+        u"Удалено дублей старых точек: {}".format(len(ids_del)),
+        u"Ошибок при создании: {}".format(cnt_err),
     ]
 
     print(u"-" * 50)
